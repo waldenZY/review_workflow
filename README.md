@@ -1,51 +1,83 @@
-# Batch Review Workflow V1
+# Eval Studio · LLM 自动化评测工作台
 
-工作流按配置、Excel、模型调用和流程控制拆成少量模块。每个审查任务放在独立的
-`tasks` 子目录中。V1 不支持断点续跑、并发、Agent、Skill 或结构化评估结果。
+单用户 Web 应用，评测已有 LLM 输出。支持本地调试及 Linux Python 环境部署。v0 已串通数据导入、字段映射、标准设计、依据检查、评测器配置、试评/批跑、人工复核和 XLSX 导出。
 
-## 使用
+**所有 LLM 步骤均为模拟，不发送真实模型请求。** 非空与 JSON Schema 等程序规则执行真实校验。模拟判断只证明流程连通，不代表内容质量或评测准确性。
 
-进入目录：
+第一次使用请阅读 [完整使用教程](docs/使用教程.md)，其中解释每个字段该填什么、各环节有什么影响，以及模拟功能的边界。
+
+## Linux 服务器运行（不需要 Node.js）
+
+直接复制或拉取本项目，包含 `backend/`、`frontend/`、`scripts/` 和 `requirements.txt`。服务器可使用任意名称的 **Python 3.10+** 环境：
+
+```bash
+cd review_workflow
+python -m pip install -r requirements.txt
+python scripts/start.py --host 0.0.0.0 --port 8000 --data-dir "$HOME/eval-studio-data"
+```
+
+访问 `http://服务器地址:8000`。Python 同时提供 API 和原生 HTML、CSS、JavaScript，开发和部署均无构建步骤，不需要 Node.js、npm 或专用发布包。详见 [Linux 部署](docs/Linux部署.md)。
+
+## 本地开发
+
+Python 服务运行和本地测试统一使用一份依赖清单：
+
+| 文件 | 用途 |
+| --- | --- |
+| `requirements.txt` | 8 项 Python 依赖，本地与服务器统一安装，包含 pytest、httpx 两项测试工具 |
+| `frontend/index.html`、`app.js`、`style.css` | 浏览器直接加载的页面源码，随项目一同复制和版本管理 |
+
+当前机器调试使用 **moto** 环境，服务器环境名称不限。安装依赖后直接启动：
 
 ```powershell
-cd D:\wwc\matter
-$python = 'D:\Application\Anaconda3-5.3.1-Windows-x86_64\envs\moto\python.exe'
+# 在 review_workflow 仓库根目录执行；使用当前机器的 moto Python。
+$motoPython = 'D:\Application\Anaconda3-5.3.1-Windows-x86_64\envs\moto\python.exe'
+& $motoPython -m pip install -r requirements.txt
+& $motoPython scripts/start.py
 ```
 
-生成评估 Prompt：
+打开 **http://127.0.0.1:8000**。接口文档在 **http://127.0.0.1:8000/docs**。启动脚本不依赖环境名称，可用 `--host`、`--port`、`--data-dir` 配置；后端固定单进程运行。
+
+修改 `frontend/` 中的页面源码后刷新浏览器即可；修改 Python 后端后重启服务。页面和 API 共用同一个端口。
+
+## 用一条记录体验
+
+1. 数据管理：点击“载入一条模拟记录”，检查字段角色并保存映射。也可导入自己的 JSONL、JSON、XLSX；不支持 CSV。
+2. 评测标准：手动填写标准名称和描述，或粘贴生成 Prompt 后模拟提取。默认模拟候选并未理解 Prompt，须人工修改确认。
+3. 保存标准后检查依据，按需要修改标准或备注，再保存。无 Prompt 时也能完成整个流程。
+4. 评测器：按标准构建草稿，配置返回 Schema 和结果映射，选择模拟场景并保存；可预览实际请求。默认模拟判定为依据不足。
+5. 执行任务：点击“试评一条”。批跑支持选中记录或全量，但开发验收仅用一条，全量需明确勾选确认。
+6. 结果与复核：查看标准结果、原始响应及配置快照，追加人工判断，选取返回字段并导出 XLSX。独立人工确认后可保存回归案例并复测。
+
+修改标准或评测器会创建新版本；历史运行仍绑定原版本。原配置失败重试追加 attempt，使用新配置复测则创建新运行。
+
+## 当前资料
+
+- [设计文档目录与迭代约定](docs/README.md)：文档职责、当前进展与维护方式。
+- [原始方案与实施交接](docs/LLM_自动化评测工作台_方案与实施交接.md)：保留原文，作为需求来源。
+- [方案评审与实施边界](docs/方案评审与实施边界.md)：分阶段调整与协议边界。
+- [样例输入与单条任务流](docs/样例输入与单条任务流.md)：仅用于理解通用流程，不把示例业务固化进产品。
+- [v0 实现与验收](docs/v0实现与验收.md)：当前能力、接口约定、存储与模拟边界、验证范围及已知限制。
+- [Linux 部署](docs/Linux部署.md)：直接复制源码、Python 启动参数及数据持久化。
+
+设计文档统一放在仓库内的 `docs/`，随代码一起记录迭代。原测试资料（包括示例生成 Prompt）保留在仓库外的 `../testdata/`，程序不会自动加载或改写。SQLite、导入副本及运行导出默认存于仓库外 `../review_workflow_data/`；可设置进程环境变量 `EVAL_DATA_DIR` 修改位置。
+
+## 重建约束
+
+- 区分任务输入、已有生成输出、参考依据和人工确认结论，字段角色由用户映射。
+- 评测标准、评测器、执行记录分别保存版本；运行时固定快照。
+- 逐条判断与批跑后分析分开；执行错误与内容判定分开。
+- 提供生成 Prompt 是可选路径；无 Prompt 也能手动建立评测方案。
+- Prompt、数据与模型响应均按其角色处理，不执行其中的指令或自动生成的代码。
+- 当前验证最多选择 **1 条**样本，不运行全量，不自动调用生成模型补齐样本。
+- 模拟响应必须明确标识；流程验证不代表评测准确性已经验证。
+- 当前机器调试使用 **moto** 环境；部署可使用其它 Python 3.10+ 环境。
+
+## 验证
 
 ```powershell
-& $python -m review_workflow build-prompt tasks\outline_review\review.yaml --gateway mock
+# 仓库根目录，使用 moto。
+& $motoPython -m pytest -q
 ```
 
-检查或修改 `tasks\outline_review\evaluation_prompt.md`，然后运行审查：
-
-```powershell
-& $python -m review_workflow run tasks\outline_review\review.yaml --gateway mock
-```
-
-结果位于 `tasks\outline_review\runs\<run_id>\`。
-
-`mock` 只用于验证流程。接入真实模型时，使用
-`--gateway package.module:create_gateway`；工厂返回的对象只需实现
-`generate(messages=..., purpose=..., metadata=...)`，并返回包含
-`raw_output` 和 `metadata` 的字典。
-
-## 使用 extapi
-
-项目已包含 `review_workflow/external_model_gateway.py`。先修改其中的：
-
-```python
-WORKSPACE_ROOT = Path("extapi 所在项目根目录")
-MODEL_NAME = "实际模型名称"
-```
-
-然后使用：
-
-```powershell
-& $python -m review_workflow build-prompt tasks\outline_review\review.yaml `
-  --gateway review_workflow.external_model_gateway:Gateway
-
-& $python -m review_workflow run tasks\outline_review\review.yaml `
-  --gateway review_workflow.external_model_gateway:Gateway
-```
+工程验证复用一条合成业务记录检查格式与故障分支，不读取外部数据集、不全量评测、不调用真实模型。当前未连接可用浏览器，真实浏览器交互及视觉验收需按上面的体验步骤人工检查。

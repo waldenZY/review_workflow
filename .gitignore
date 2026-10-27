@@ -1,5 +1,19 @@
 __pycache__/
 *.pyc
-tasks/*/runs/
-tasks/*/evaluation_prompt.md
-tasks/*/evaluation_prompt.meta.json
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# Local datasets, runs, exports, and application state.
+/data/
+/runs/
+/exports/
+/storage/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm

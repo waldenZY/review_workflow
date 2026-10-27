@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Start Eval Studio in mock-only mode (Python runtime only).')
+    parser = argparse.ArgumentParser(description='Start Eval Studio in mock-default mode (Python runtime only).')
     parser.add_argument('--host', default='127.0.0.1', help='Bind address; use 0.0.0.0 for server access.')
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--data-dir', type=Path, help='Writable runtime directory outside the application. Overrides EVAL_DATA_DIR.')
@@ -25,7 +25,7 @@ def main():
     except ModuleNotFoundError:
         parser.error('Python dependencies are missing. Run: python -m pip install -r requirements.txt')
     sys.path.insert(0, str(repo_root))
-    print(f'Eval Studio (mock only): http://{args.host}:{args.port}', flush=True)
+    print(f'Eval Studio (mock by default): http://{args.host}:{args.port}', flush=True)
     uvicorn.run('backend.app:app', host=args.host, port=args.port, workers=1)
 
 

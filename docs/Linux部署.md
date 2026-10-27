@@ -19,7 +19,7 @@ python -m pip install -r requirements.txt
 python scripts/start.py --host 0.0.0.0 --port 8000 --data-dir "$HOME/eval-studio-data"
 ```
 
-没有独立环境时，可先使用 `python3 -m venv .venv` 和 `. .venv/bin/activate` 准备环境。依赖清单只有一份，也包含 pytest、httpx 两项测试工具。pip 需要可用的 Python 包源，当前不提供离线依赖集合。
+没有独立环境时，可先使用 `python3 -m venv .venv` 和 `. .venv/bin/activate` 准备环境。依赖清单只有一份，httpx 用于真实模型调用，pytest 用于测试。pip 需要可用的 Python 包源，当前不提供离线依赖集合。
 
 浏览器打开 `http://服务器地址:8000`。Python 在同一地址提供页面、`/static` 资源及 `/api/v1` 接口；接口文档位于 `/docs`，健康检查位于 `/api/v1/health`。没有额外前端服务或开发代理端口。
 
@@ -38,8 +38,33 @@ SQLite、导入副本和导出产物在数据目录中。更新程序时保留�
 
 当前采用单进程、单队列，不开启多个 Uvicorn worker。v0 是无登录的单用户工具，适用于受控内网；进程常驻方式可沿用服务器已有管理工具。
 
+## 可选：真实模型配置
+
+```bash
+cp config/llm_config.example.json config/llm_config.local.json
+# 编辑本项目的完整地址、密钥和参数，然后重启 Python 服务
+```
+
+配置路径固定相对于项目根目录，不受启动工作目录影响。示例不含可用凭证；local 文件被 Git 忽略，请在服务器保留自己的文件。程序不读取 project1 配置、不自动读取 .env，也不提供网页密钥接口。
+
+| 字段 | 含义 |
+| --- | --- |
+| api_url | 完整 HTTP(S) Chat Completions 调用地址，不自动追加路径 |
+| api_key | 仅后端使用的 Bearer 凭证 |
+| model | 供应商支持的模型标识 |
+| max_tokens | 正整数，单次输出 Token 上限 |
+| timeout | 有限正数，httpx 网络操作超时秒数 |
+| stream | 布尔值；false 接收普通 JSON，true 解析 SSE |
+| enable_thinking / skip_special_tokens | 布尔值，按 project1 协议放在请求的 extra_body 对象内 |
+
+八个字段必须完整提供，不能添加其它字段。启动时校验并固定到进程内；更改后必须重启，网页刷新不会重新读取配置。不自动增加 response_format，结果通过 Prompt 和本地 Schema 约束；请核对你的供应商是否支持这些参数。
+
+`/api/v1/llm/status` 仅返回脱敏状态。真实地址只记录 SHA256；公开配置指纹包含地址哈希及公开参数，排除密钥。仅更换密钥不影响旧运行重试，模型、地址或公开参数变化会阻止原配置重试，应在页面选择模式后新建复测。没有配置或配置错误仍可使用模拟模式，不发起启动探测。
+
+SQLite 采用增量建表，保留已有记录和快照。升级前可停服务备份整个数据目录；恢复时保留 SQLite、imports 和 runs。历史归档只是隐藏整个对象，仍可查看和恢复；永久删除受引用保护，只清理所属数据目录内的文件，操作时间留在审计记录中。
+
 ## 验证边界
 
 Python 测试直接复制后端、启动脚本及真实前端源码，在 PATH 不包含 Node.js、工作目录位于应用之外的情况下启动服务，检查 HTML、JavaScript、CSS、API 及独立数据目录。整个过程不构建页面、不生成专用发布包，不读取外部业务测试数据。
 
-当前尚未连接实际 Linux 服务器，也未完成真实浏览器视觉验收。所有模型步骤继续使用模拟响应，不在本次修改中接入真实模型。
+当前尚未连接实际 Linux 服务器，也未完成真实浏览器视觉验收。自动测试对真实调用分支使用模拟网络，不读取业务测试集。真实服务的鉴权、兼容性及评测质量由用户填写本项目配置后单条试评验收，程序不会自动调用其它项目的服务。

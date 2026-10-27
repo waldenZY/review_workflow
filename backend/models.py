@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, model_validator
 Verdict = Literal['pass', 'fail', 'insufficient_evidence', 'not_applicable']
 VERDICTS = get_args(Verdict)
 Role = Literal['input', 'output', 'reference']
+ExecutionMode = Literal['mock', 'real']
 
 
 class MappingSave(BaseModel):
@@ -33,6 +34,7 @@ class SpecSave(BaseModel):
     design_notes: str = ''
     criteria: list[Criterion] = Field(min_length=1)
     design_traces: list[dict[str, Any]] = Field(default_factory=list)
+    design_call_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode='after')
     def unique_ids(self):
@@ -82,6 +84,7 @@ class EvaluatorSave(BuildRequest):
 
 
 class PreviewRequest(BaseModel):
+    execution_mode: ExecutionMode = 'mock'
     mapping_id: str
     mapping_version: int = Field(ge=1)
     evaluator_id: str
@@ -90,6 +93,7 @@ class PreviewRequest(BaseModel):
 
 
 class RunRequest(BaseModel):
+    execution_mode: ExecutionMode = 'mock'
     mapping_id: str
     mapping_version: int = Field(ge=1)
     evaluator_id: str
@@ -107,11 +111,13 @@ class ReviewSave(BaseModel):
 
 
 class ExtractRequest(BaseModel):
+    execution_mode: ExecutionMode = 'mock'
     generation_prompt: str = Field(min_length=1)
     mock_response: str | None = None
 
 
 class AnalysisRequest(BaseModel):
+    execution_mode: ExecutionMode = 'mock'
     mapping_id: str
     mapping_version: int = Field(ge=1)
     spec_id: str
@@ -127,3 +133,8 @@ class ExportRequest(BaseModel):
 class RetryRequest(BaseModel):
     evaluator_id: str | None = None
     evaluator_version: int | None = Field(default=None, ge=1)
+    execution_mode: ExecutionMode = 'mock'
+
+
+class DeleteRequest(BaseModel):
+    confirm_id: str

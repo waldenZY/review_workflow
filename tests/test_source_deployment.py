@@ -68,7 +68,7 @@ def test_copied_source_starts_without_node_from_unrelated_directory(copied_sourc
                     time.sleep(0.05)
                 else:
                     pytest.fail(log_path.read_text(encoding='utf-8'))
-                assert health.json()['mode'] == 'mock_only'
+                assert health.json()['mode'] == 'mock_default'
                 assert Path(health.json()['data_dir']) == runtime.resolve()
                 assert '/static/app.js' in client.get('/').text
                 assert client.get('/static/app.js').text == (SOURCE / 'frontend' / 'app.js').read_text(encoding='utf-8')

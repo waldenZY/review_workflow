@@ -7,6 +7,7 @@ from jsonschema import Draft202012Validator
 
 from .data_io import MISSING, at, flatten
 from .models import VERDICTS, ModelConfig
+from .llm import GatewayError, LlmService
 from .store import now, uid
 
 DEFAULT_PROMPT = '''你是评测裁判。仅按已确认标准评测已有输出，逐项给出判断和可定位的依据。
@@ -77,21 +78,6 @@ def make_request(purpose, system, data, config=None, schema=None):
             'timeout_seconds': config['timeout_seconds'], 'body': body}
 
 
-class MockGateway:
-    """No network client exists in v0. Content is supplied explicitly, never inferred."""
-
-    def invoke(self, request, content, scenario='pass'):
-        if scenario == 'request_error':
-            raise RuntimeError('模拟调用失败：未发送任何网络请求。')
-        if scenario == 'invalid_json':
-            content = '{mock: invalid JSON'
-        elif scenario == 'schema_error':
-            content = '{}'
-        return {'id': uid('mock'), 'object': 'chat.completion', 'model': request['body']['model'],
-                'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': content}, 'finish_reason': 'stop'}],
-                'usage': None, 'is_mock': True, 'purpose': request['purpose']}
-
-
 def role_values(mapping, row):
     return {role: {path: at(row['original'], path, None) for path in mapping[key]}
             for role, key in [('input', 'inputs'), ('output', 'outputs'), ('reference', 'references')]}
@@ -108,10 +94,12 @@ def judge_request(mapping, spec, evaluator, row):
         {'fields': role_values(mapping, row), 'generation_task_prompt': spec['generation_prompt']}, evaluator['config'], evaluator['response_schema'])
 
 
-def evaluate(mapping, spec, evaluator, row):
+def evaluate(mapping, spec, evaluator, row, service=None, execution_mode='mock', expected_fingerprint=None):
+    service = service or LlmService()
     request = judge_request(mapping, spec, evaluator, row)
-    attempt = {'id': uid('attempt'), 'started_at': now(), 'finished_at': None, 'is_mock': True,
-               'request': request, 'raw_response': None, 'raw_output': None, 'parsed': None, 'criteria': [],
+    attempt = {'id': uid('attempt'), 'started_at': now(), 'finished_at': None, 'is_mock': execution_mode == 'mock',
+               'execution_mode': execution_mode, 'model_called': False,
+               'request': None, 'raw_response': None, 'raw_output': None, 'parsed': None, 'criteria': [],
                'status': 'running', 'error': None, 'usage': None}
     values = role_values(mapping, row)
     if not any(at(row['original'], path) is not MISSING and at(row['original'], path) is not None for path in mapping['outputs']):
@@ -145,13 +133,15 @@ def evaluate(mapping, spec, evaluator, row):
         return attempt
     stage = 'call_failed'
     try:
+        if execution_mode == 'real' and expected_fingerprint and service.require().public()['fingerprint'] != expected_fingerprint:
+            raise ValueError('当前服务配置与运行快照不一致，请新建复测。')
+        request = service.prepare(request, execution_mode)
+        attempt['request'] = request
         mock_payload = {'criteria': {c['id']: {'verdict': evaluator['mock_scenario'] if evaluator['mock_scenario'] in VERDICTS else 'insufficient_evidence',
                                             'reason': '预设模拟判定，仅用于验证流程，不代表真实评测。', 'evidence': []}
                                      for c in spec['criteria'] if c['enabled'] and c['method'] == 'llm'}}
         content = evaluator['mock_response'] if evaluator['mock_response'] is not None else json.dumps(mock_payload, ensure_ascii=False)
-        response = MockGateway().invoke(request, content, evaluator['mock_scenario'])
-        attempt['raw_response'] = response
-        attempt['raw_output'] = response['choices'][0]['message']['content']
+        attempt.update(service.invoke(request, content, evaluator['mock_scenario']))
         stage = 'parse_failed'
         parsed = json.loads(attempt['raw_output'], parse_constant=lambda value: (_ for _ in ()).throw(ValueError('不支持非有限数值：' + value)))
         attempt['parsed'] = parsed
@@ -178,7 +168,9 @@ def evaluate(mapping, spec, evaluator, row):
         attempt['criteria'].extend(normalized)
         attempt['status'] = 'completed'
     except Exception as exc:
-        attempt.update(status=stage, error=str(exc))
+        if isinstance(exc, GatewayError):
+            attempt.update(exc.trace)
+        attempt.update(status=stage, error=service.sanitize(str(exc)))
     attempt['finished_at'] = now()
     return attempt
 
@@ -202,8 +194,9 @@ def summary(run):
 
 
 class Runner:
-    def __init__(self, store):
+    def __init__(self, store, service=None):
         self.store = store
+        self.service = service or LlmService()
         self.queue = queue.Queue()
         self.stop = threading.Event()
         for run in store.runs():
@@ -230,7 +223,8 @@ class Runner:
             try:
                 self.execute(run_id)
             except Exception as exc:
-                self.store.update_run(run_id, lambda run: run.update(status='failed', error=str(exc), finished_at=now()))
+                if not self.stop.is_set():
+                    self.store.update_run(run_id, lambda run: run.update(status='failed', error=self.service.sanitize(str(exc)), finished_at=now()))
             finally:
                 self.queue.task_done()
 
@@ -252,7 +246,10 @@ class Runner:
                 self.store.update_run(run_id, lambda value: value.update(status='cancelled', finished_at=now()))
                 return
             self.store.update_run(run_id, lambda value: value['records'][index].update(status='running'))
-            attempt = evaluate(snapshot['mapping'], snapshot['spec'], snapshot['evaluator'], rows[record['row_id']])
+            attempt = evaluate(snapshot['mapping'], snapshot['spec'], snapshot['evaluator'], rows[record['row_id']],
+                               self.service, run.get('execution_mode', 'mock'), snapshot.get('model_config', {}).get('fingerprint'))
+            if self.stop.is_set():
+                return  # Do not touch a closed store after a long HTTP call finishes during shutdown.
 
             def complete(value):
                 target = value['records'][index]
@@ -293,7 +290,7 @@ def export_table(run, selected_fields):
     for source in originals:
         record = records.get(source['row_id'])
         attempt = record['attempts'][-1] if record and record['attempts'] else None
-        extra = [source['row_id'], record['status'] if record else 'not_run', True,
+        extra = [source['row_id'], record['status'] if record else 'not_run', run.get('is_mock', True),
                  attempt['error'] if attempt else None, attempt['criteria'] if attempt else [],
                  record['reviews'] if record else []]
         rows.append([source['original'].get(column) for column in original_columns] + extra + [flat.get(source['row_id'], {}).get(field) for field in fields])

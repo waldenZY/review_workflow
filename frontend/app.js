@@ -15,14 +15,17 @@
     ['评测器', '配置与请求预览', '构建评测器，检查实际请求，然后开始试评。'],
     ['执行任务', '试评与批量运行', '先看一条，再决定运行范围。每次运行固定数据与配置版本。'],
     ['结果与复核', '查看、校准与导出', '保留原始响应、人工修订与每一次执行尝试。'],
+    ['历史管理', '加载、归档与溯源', '查看历史对象、引用关系和操作记录，归档可恢复，删除受引用保护。'],
   ];
   const criterion = id => ({ id, name: '', description: '', enabled: true, method: 'llm', required_roles: ['output'], target_field: '', rule_schema: { type: 'object' }, schemaText: '{"type":"object"}' });
   const s = {
     page: 0, catalog: { datasets: [], mappings: [], specs: [], evaluators: [], runs: [], cases: [] },
     dataset: null, rows: [], offset: 0, selected: [], mapping: { inputs: [], outputs: [], references: [] }, mappingDirty: true,
     savedSpec: null, title: '我的评测方案', generationPrompt: '', designNotes: '', criteria: [criterion('C001')], specDirty: true,
-    traces: [], extractMock: '', analysisMock: '', analysis: null, specVersions: [], evaluatorVersions: [],
-    evaluator: null, evaluatorDirty: true, schemaText: '', projectionText: '', parametersText: '{}', preview: null,
+    traces: [], designCallIds: [], extractMock: '', analysisMock: '', analysis: null, specVersions: [], evaluatorVersions: [],
+    evaluator: null, evaluatorDirty: true, schemaText: '', projectionText: '', preview: null,
+    llmStatus: { configured: false, message: '正在读取配置状态…' }, extractMode: 'mock', analysisMode: 'mock', runMode: 'mock',
+    historyKind: 'dataset', includeArchived: false, historyItems: [], historyDetail: null, compareLeft: '', compareRight: '', compareResult: null,
     run: null, rowIndex: 0, attemptIndex: -1, exportFields: [], selectionMode: 'selected', allConfirmed: false,
     reviewCriterion: '', reviewVerdict: 'insufficient_evidence', reviewReason: '', saveCase: false, confirmHuman: false,
     file: null, sheets: [], sheet: '', headerRow: 1, busy: '', notice: '', error: '', errorTrace: null, online: false,
@@ -47,14 +50,17 @@
   function details(id, title, content) { return `<details id="${id}" class="advanced"><summary>${esc(title)}</summary>${content}</details>`; }
   function panel(title, description, content, control = '') { return `<section class="panel"><div class="panel-heading"><div><h2>${title}</h2><p>${esc(description)}</p></div>${control}</div>${content}</section>`; }
   function next(page, text) { return `<div class="step-footer"><span>${esc(text)}</span><button class="button primary" data-page="${page}">下一步 · ${steps[page][0]}${icon('arrow')}</button></div>`; }
-  function ready() { return Boolean(s.mapping.id && !s.mappingDirty && s.evaluator?.id && !s.evaluatorDirty && !s.specDirty); }
+  function ready() { return Boolean(s.mapping.id && !s.mappingDirty && s.evaluator?.id && !s.evaluatorDirty && !s.specDirty && !s.dataset?.archived_at && !s.savedSpec?.archived_at && !s.evaluator?.archived_at); }
+  function canCall(mode) { return mode === 'mock' || s.llmStatus.configured; }
+  function modeControl(bind, mode) { return field('本环节调用模式', select(bind, [['mock', '模拟（不发送请求）'], ['real', '真实（发送模型请求）']], mode), mode === 'real' ? (s.llmStatus.configured ? '将使用服务端已加载的模型配置。' : s.llmStatus.message) : '默认模拟，切换只影响本环节。'); }
+  function connectionView() { return `<div class="build-banner"><div>${icon('shield')}<span>${s.llmStatus.configured ? '服务端连接已配置' : '真实调用未就绪，模拟仍可使用'} · 修改 JSON 后重启生效</span></div></div>${s.llmStatus.configured ? json(s.llmStatus.parameters) : `<div class="empty-inline">${esc(s.llmStatus.message)} 请按项目示例创建本地配置。</div>`}`; }
   function previewRow() { return s.selected[0] || s.rows[0]?.row_id; }
   function requireReady() { if (!ready()) throw new Error('请先保存字段映射、标准和评测器，未保存的修改不能用于运行。'); }
 
   async function api(path, method = 'GET', body) {
     const response = await fetch('/api/v1' + path, { method, headers: body === undefined || body instanceof FormData ? undefined : { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body) });
     const value = await response.json();
-    if (!response.ok) { const error = new Error(typeof value.detail === 'string' ? value.detail : pretty(value.detail || value)); error.trace = value.trace; throw error; }
+    if (!response.ok) { const error = new Error(typeof value.detail === 'string' ? value.detail : pretty(value.detail || value)); error.trace = value.trace || (value.references ? { references: value.references } : null); throw error; }
     return value;
   }
   async function action(label, task) {
@@ -77,10 +83,11 @@
   function loadSpec(value) {
     s.savedSpec = value; s.title = value.title; s.generationPrompt = value.generation_prompt; s.designNotes = value.design_notes || '';
     s.criteria = clone(value.criteria).map(c => ({ ...c, schemaText: pretty(c.rule_schema) })); s.traces = clone(value.design_traces || []);
+    s.designCallIds = [...(value.design_call_ids || [])];
     s.specDirty = false; s.analysis = null; s.specVersions = []; localStorage.setItem('eval.spec', value.id);
   }
   function loadEvaluator(value) {
-    s.evaluator = clone(value); s.schemaText = pretty(value.response_schema); s.projectionText = pretty(value.projection); s.parametersText = pretty(value.config.parameters);
+    s.evaluator = clone(value); s.schemaText = pretty(value.response_schema); s.projectionText = pretty(value.projection);
     s.evaluatorDirty = !value.id; s.preview = null; s.evaluatorVersions = [];
     if (value.id) localStorage.setItem('eval.evaluator', value.id);
   }
@@ -115,13 +122,13 @@
     requireReady(); const mode = single ? 'selected' : s.selectionMode;
     if (mode === 'all' && !s.allConfirmed) throw new Error('全量运行需要明确确认；开发验证请只选一条。');
     const rowIds = mode === 'all' ? [] : single ? [previewRow()].filter(Boolean) : s.selected;
-    const value = await api('/runs', 'POST', { mapping_id: s.mapping.id, mapping_version: s.mapping.version, evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version, selection_mode: mode, row_ids: rowIds });
-    await loadRun(value.id); await refresh(); s.page = 3; s.notice = '任务已提交，所有模型步骤均为模拟。';
+    const value = await api('/runs', 'POST', { mapping_id: s.mapping.id, mapping_version: s.mapping.version, evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version, selection_mode: mode, row_ids: rowIds, execution_mode: s.runMode });
+    await loadRun(value.id); await refresh(); s.page = 3; s.notice = `任务已提交，执行模式：${s.runMode === 'real' ? '真实' : '模拟'}。程序规则独立执行。`;
   }
   async function exportRun() {
     const response = await fetch(`/api/v1/runs/${s.run.id}/export`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields: s.exportFields }) });
     if (!response.ok) throw new Error((await response.json()).detail);
-    const url = URL.createObjectURL(await response.blob()); const link = document.createElement('a'); link.href = url; link.download = `${s.run.id}_mock.xlsx`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const url = URL.createObjectURL(await response.blob()); const link = document.createElement('a'); link.href = url; link.download = `${s.run.id}_${s.run.is_mock ? 'mock' : 'real'}.xlsx`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     s.notice = '已导出 XLSX，完整快照同时保存在外部运行目录。';
   }
 
@@ -138,14 +145,19 @@
   }
 
   function versionButtons(type, versions) {
-    return versions.length ? `<div class="version-list">${versions.map(v => button('load-version', `v${v.version} · ${new Date(v.created_at).toLocaleString('zh-CN')}`, '', false, `data-type="${type}" data-version="${v.version}"`)).join('')}</div>` : '';
+    if (!versions.length) return '';
+    const id = versions[0].id;
+    if (!versions.some(v => String(v.version) === String(s.compareLeft))) s.compareLeft = versions.at(-1).version;
+    if (!versions.some(v => String(v.version) === String(s.compareRight))) s.compareRight = versions[0].version;
+    const choices = versions.map(v => [v.version, `v${v.version}`]);
+    return `<div class="version-list">${versions.map(v => button('load-version', `v${v.version} · ${new Date(v.created_at).toLocaleString('zh-CN')}`, '', false, `data-type="${type}" data-version="${v.version}"`)).join('')}</div>${versions.length > 1 ? `<div class="toolbar">${field('对比版本 A', select('compareLeft', choices, s.compareLeft || versions.at(-1).version))}${field('对比版本 B', select('compareRight', choices, s.compareRight || versions[0].version))}${button('compare-versions', '比较版本差异', '', false, `data-id="${id}" data-left="${versions.at(-1).version}" data-right="${versions[0].version}"`)}</div>` : ''}${s.compareResult?.left.id === id ? json(s.compareResult.differences) : ''}`;
   }
   function standardPage() {
-    let html = panel('评测方案', '没有生成 Prompt 也可以手动定义标准。', field('方案名称', input('title', s.title)) + field('生成任务 Prompt（可选）', textarea('generationPrompt', s.generationPrompt, 5), '只用作候选标准来源，不执行其中的任务。') + `<div class="toolbar"><label class="button file-button">读取 .md / .txt<input type="file" data-file="prompt" accept=".md,.txt" hidden></label>${button('extract', icon('lab') + '模拟提取候选标准（替换草稿）', 'secondary', !s.generationPrompt.trim())}</div>` + details('extract-response', '高级 · 提取步骤的模拟 JSON 响应', textarea('extractMock', s.extractMock, 5, true, '留空使用通用模拟候选。自定义格式：{"criteria": [...]}')), `<div class="button-group">${select('specChoice', [['', '选择已有方案'], ...s.catalog.specs.map(v => [v.id, `${v.title} · v${v.version}`])], s.savedSpec?.id || '', '打开标准方案')}${button('new-spec', icon('plus') + '新建')}</div>`);
-    const cards = s.criteria.map((c, i) => `<article class="criterion-card ${c.enabled ? '' : 'disabled-card'}"><div class="criterion-top"><span class="criterion-order">${String(i + 1).padStart(2, '0')}</span><input data-bind="criteria.${i}.id" class="id-input mono" aria-label="标准 ${i + 1} ID" value="${esc(c.id)}"><input data-bind="criteria.${i}.name" class="criterion-name" aria-label="标准 ${i + 1} 名称" placeholder="为这条标准命名" value="${esc(c.name)}">${checkbox(`criteria.${i}.enabled`, c.enabled, '启用')}${button('delete-criterion', icon('trash'), '', false, `data-index="${i}" aria-label="删除标准 ${i + 1}"`)}</div>${textarea(`criteria.${i}.description`, c.description, 2, false, '说明判断范围、合格条件和边界…')}<div class="criterion-options">${field('评测方式', select(`criteria.${i}.method`, [['llm', 'LLM 判断（模拟）'], ['non_empty', '程序规则 · 非空'], ['json_schema', '程序规则 · JSON Schema']], c.method))}<div class="field"><span>必要依据</span><div class="role-options">${[['input', '任务输入'], ['output', '已有输出'], ['reference', '参考依据']].map(([value, label]) => `<label class="check-label"><input type="checkbox" data-criterion-role="${value}" data-index="${i}" ${c.required_roles.includes(value) ? 'checked' : ''}>${label}</label>`).join('')}</div></div>${c.method !== 'llm' ? field('规则作用字段', select(`criteria.${i}.target_field`, [['', '第一个已映射输出'], ...s.mapping.outputs.map(v => [v, v])], c.target_field)) : ''}</div>${c.method === 'json_schema' ? field('待评测输出 JSON Schema', textarea(`criteria.${i}.schemaText`, c.schemaText, 5, true)) : ''}</article>`).join('');
+    let html = panel('评测方案', '没有生成 Prompt 也可以手动定义标准。', field('方案名称', input('title', s.title)) + field('生成任务 Prompt（可选）', textarea('generationPrompt', s.generationPrompt, 5), '只用于设计标准，不执行生成任务。') + modeControl('extractMode', s.extractMode) + `<div class="toolbar"><label class="button file-button">读取 .md / .txt<input type="file" data-file="prompt" accept=".md,.txt" hidden></label>${button('extract', icon('lab') + (s.extractMode === 'real' ? '真实提取候选（替换草稿）' : '模拟提取候选（替换草稿）'), 'secondary', !s.generationPrompt.trim() || !canCall(s.extractMode))}</div>` + (s.extractMode === 'mock' ? details('extract-response', '高级 · 模拟 JSON 响应', textarea('extractMock', s.extractMock, 5, true)) : ''), `<div class="button-group">${select('specChoice', [['', '选择已有方案'], ...s.catalog.specs.map(v => [v.id, `${v.title} · v${v.version}`])], s.savedSpec?.id || '', '打开标准方案')}${button('new-spec', icon('plus') + '新建')}</div>`);
+    const cards = s.criteria.map((c, i) => `<article class="criterion-card ${c.enabled ? '' : 'disabled-card'}"><div class="criterion-top"><span class="criterion-order">${String(i + 1).padStart(2, '0')}</span><input data-bind="criteria.${i}.id" class="id-input mono" aria-label="标准 ${i + 1} ID" value="${esc(c.id)}"><input data-bind="criteria.${i}.name" class="criterion-name" aria-label="标准 ${i + 1} 名称" placeholder="为这条标准命名" value="${esc(c.name)}">${checkbox(`criteria.${i}.enabled`, c.enabled, '启用')}${button('delete-criterion', icon('trash'), '', false, `data-index="${i}" aria-label="删除标准 ${i + 1}"`)}</div>${textarea(`criteria.${i}.description`, c.description, 2, false, '说明判断范围、合格条件和边界…')}<div class="criterion-options">${field('评测方式', select(`criteria.${i}.method`, [['llm', 'LLM 判断'], ['non_empty', '程序规则 · 非空'], ['json_schema', '程序规则 · JSON Schema']], c.method))}<div class="field"><span>必要依据</span><div class="role-options">${[['input', '任务输入'], ['output', '已有输出'], ['reference', '参考依据']].map(([value, label]) => `<label class="check-label"><input type="checkbox" data-criterion-role="${value}" data-index="${i}" ${c.required_roles.includes(value) ? 'checked' : ''}>${label}</label>`).join('')}</div></div>${c.method !== 'llm' ? field('规则作用字段', select(`criteria.${i}.target_field`, [['', '第一个已映射输出'], ...s.mapping.outputs.map(v => [v, v])], c.target_field)) : ''}</div>${c.method === 'json_schema' ? field('待评测输出 JSON Schema', textarea(`criteria.${i}.schemaText`, c.schemaText, 5, true)) : ''}</article>`).join('');
     html += panel(`独立评测标准 <span class="count-tag">${s.criteria.length}</span>`, '标准 ID 用于版本间追踪。', `<div class="criteria-list">${cards}</div>` + field('人工确认与设计备注', textarea('designNotes', s.designNotes, 2)) + `<div class="panel-footer"><span data-save-state="spec">${s.specDirty ? '草稿有未保存修改' : `标准 v${s.savedSpec.version} 已保存`}</span>${button('save-spec', icon('save') + (s.savedSpec ? `保存为 v${s.savedSpec.version + 1}` : '保存标准'), 'primary', !s.criteria.length)}</div>${s.savedSpec ? details('spec-versions', '标准历史版本', button('spec-versions', '刷新历史版本') + versionButtons('spec', s.specVersions)) : ''}`, button('add-criterion', icon('plus') + '添加标准'));
     const analysis = s.analysis ? `<div class="analysis-grid">${s.analysis.reports.map(r => `<div class="analysis-card"><strong>${esc(r.criterion_id)}</strong>${badge(r.missing_roles.length ? 'insufficient_evidence' : '角色内容已提供')}<p>需要：${esc(r.required_roles.join(' / '))}</p>${r.missing_roles.length ? `<p>缺少：${esc(r.missing_roles.join(' / '))}</p>` : ''}<small>${esc(r.risk)}</small></div>`).join('')}</div>${json(s.analysis.advice)}` : '<div class="empty-inline">先保存字段映射和标准，再选一条记录检查依据。</div>';
-    html += panel('依据与可评测性', '真实检查字段角色是否有内容，分析建议使用模拟响应；不保证语义充分。', analysis + details('analysis-response', '高级 · 分析步骤的模拟 JSON 响应', textarea('analysisMock', s.analysisMock, 4, true)) + (s.traces.length ? details('design-traces', `设计请求与模拟响应（${s.traces.length}）`, json(s.traces)) : ''), button('analyze', icon('shield') + '检查依据（模拟建议）', 'secondary', !s.savedSpec || s.specDirty || !s.mapping.id || s.mappingDirty || !previewRow()));
+    html += panel('依据与可评测性', '程序检查材料是否提供，模型建议不覆盖确定的缺失；不保证语义充分。', modeControl('analysisMode', s.analysisMode) + analysis + (s.analysisMode === 'mock' ? details('analysis-response', '高级 · 分析步骤模拟 JSON', textarea('analysisMock', s.analysisMock, 4, true)) : '') + (s.traces.length ? details('design-traces', `设计调用记录（${s.traces.length}）`, json(s.traces)) : ''), button('analyze', icon('shield') + (s.analysisMode === 'real' ? '真实分析依据' : '检查依据（模拟建议）'), 'secondary', !s.savedSpec || s.specDirty || !s.mapping.id || s.mappingDirty || !previewRow() || !canCall(s.analysisMode)));
     return html + next(2, '保存标准后，构建绑定该版本的评测器。');
   }
 
@@ -154,19 +166,19 @@
     let content = `<div class="build-banner"><div>${icon()}<span>当前标准：<strong>${esc(s.savedSpec?.title || '尚未保存')}</strong>${s.savedSpec ? ` · v${s.savedSpec.version}` : ''}${s.specDirty ? '（草稿未保存）' : ''}</span></div>${button('build', icon('lab') + '按标准构建草稿', 'secondary', !s.savedSpec || s.specDirty)}</div>`;
     if (ev) {
       content += `<div class="binding-note">本评测器绑定标准 <code>${esc(ev.spec_id)}</code> · v${ev.spec_version}${ev.version ? ` / 评测器 v${ev.version}` : ''}</div>` + field('Judge Prompt', textarea('evaluator.prompt', ev.prompt, 6));
-      content += `<div class="form-grid">${field('Base URL（仅预览）', input('evaluator.config.base_url', ev.config.base_url))}${field('模型名称（模拟）', input('evaluator.config.model', ev.config.model))}${field('API Key 环境变量名', input('evaluator.config.api_key_env', ev.config.api_key_env), '只保存变量名，不读取密钥。')}${field('预设输出模式', select('evaluator.config.output_mode', [['json_object', 'JSON Object'], ['json_schema', 'JSON Schema'], ['text', 'Text（本地仍校验 Schema）']], ev.config.output_mode))}${field('预设超时（秒）', input('evaluator.config.timeout_seconds', ev.config.timeout_seconds, 'number', 'min="1" max="600"'))}${field('模型参数 JSON', textarea('parametersText', s.parametersText, 2, true))}</div>`;
+      content += connectionView();
       content += `<div class="form-grid">${field('评测返回 JSON Schema', textarea('schemaText', s.schemaText, 13, true))}${field('结果路径映射', textarea('projectionText', s.projectionText, 13, true), '使用 JSON Pointer。未映射标准不参与统计。')}</div><div class="mock-config"><h3>${icon('lab')}模拟响应配置</h3><p>预设结论不分析内容，用于验证解析与失败处理。</p>${field('模拟场景', select('evaluator.mock_scenario', [...verdicts.map(v => [v, labels[v]]), ['invalid_json', '非法 JSON'], ['schema_error', 'Schema 不匹配'], ['request_error', '调用失败']], ev.mock_scenario))}${field('自定义模拟响应正文（可选）', textarea('evaluator.mock_response', ev.mock_response || '', 5, true), '修改返回 Schema 后，请同步填写兼容的模拟 JSON。故障场景优先于自定义正文。')}</div><div class="panel-footer"><span data-save-state="evaluator">${s.evaluatorDirty ? '评测器有未保存修改' : `评测器 v${ev.version} 已保存`}</span>${button('save-evaluator', icon('save') + '保存评测器版本', 'primary')}</div>${ev.id ? details('evaluator-versions', '评测器历史版本', button('evaluator-versions', '刷新历史版本') + versionButtons('evaluator', s.evaluatorVersions)) : ''}`;
     } else content += '<div class="empty-state"><h3>还没有评测器</h3><p>先保存标准，再按标准构建草稿。</p></div>';
-    return panel('评测器配置', '标准决定评什么，评测器决定如何执行。', content, select('evaluatorChoice', [['', '选择已有评测器'], ...s.catalog.evaluators.map(v => [v.id, `${v.id.slice(-8)} · v${v.version} · 标准 v${v.spec_version}`])], ev?.id || '', '打开评测器')) + panel('实际请求预览', '使用选中的第一条记录，预览不触发调用。', s.preview ? json(s.preview) : '<div class="empty-inline">保存配置后，可核对完整请求及版本。</div>', button('preview', icon('code') + '预览请求', 'secondary', !ready() || !previewRow())) + next(3, 'v0 不会向预设地址发送真实模型请求。');
+    return modeControl('runMode', s.runMode) + panel('评测器配置', '标准决定评什么，评测器决定如何执行。', content, select('evaluatorChoice', [['', '选择已有评测器'], ...s.catalog.evaluators.map(v => [v.id, `${v.id.slice(-8)} · v${v.version} · 标准 v${v.spec_version}`])], ev?.id || '', '打开评测器')) + panel('实际请求预览', '使用选中的第一条记录，预览不触发调用。', s.preview ? json(s.preview) : '<div class="empty-inline">保存配置后，可核对完整请求及版本。</div>', button('preview', icon('code') + '预览请求', 'secondary', !ready() || !previewRow())) + next(3, '请求预览使用执行环节选定模式，预览不发送请求。');
   }
 
   function executionPage() {
     const mode = s.selectionMode;
-    let html = panel('创建评测任务', '运行固定当前保存版本，不受后续编辑影响。', `<div class="run-config"><div><span class="tiny-label">数据集</span><strong>${esc(s.dataset?.filename || '尚未选择')}</strong></div><div><span class="tiny-label">字段映射</span><strong>${s.mapping.id ? `v${s.mapping.version}${s.mappingDirty ? ' · 有修改' : ''}` : '尚未保存'}</strong></div><div><span class="tiny-label">标准 / 评测器</span><strong>${s.evaluator?.id ? `标准 v${s.evaluator.spec_version} / 评测器 v${s.evaluator.version}` : '尚未保存'}</strong></div></div><div class="selection-options">${[['selected', '选中的样本', `当前选择 ${s.selected.length} 条`], ['all', '全部记录', `共 ${s.dataset?.row_count || 0} 条，需要明确确认`]].map(([value, title, hint]) => `<label class="selection-card ${mode === value ? 'chosen' : ''}"><input type="radio" name="selection" data-bind="selectionMode" value="${value}" ${mode === value ? 'checked' : ''}><span><strong>${title}</strong><small>${hint}</small></span></label>`).join('')}</div>${mode === 'all' ? `<div class="toolbar">${checkbox('allConfirmed', s.allConfirmed, `我确认运行全部 ${s.dataset?.row_count || 0} 条记录。开发验证只选一条。`)}</div>` : ''}${!ready() ? '<div class="inline-note">请先保存字段映射、标准与评测器。</div>' : ''}<div class="panel-footer"><span>串行执行 · 逐条保存 · 支持取消与重试</span><div class="button-group">${button('trial', icon('lab') + '试评一条', '', !ready() || !previewRow())}${button('run', icon('play') + '开始评测', 'primary', !ready() || (mode === 'all' ? !s.allConfirmed : !s.selected.length))}</div></div>`, '<span class="mock-pill">仅模拟</span>');
+    let html = modeControl('runMode', s.runMode) + panel('创建评测任务', '运行固定当前保存版本，不受后续编辑影响。', `<div class="run-config"><div><span class="tiny-label">数据集</span><strong>${esc(s.dataset?.filename || '尚未选择')}</strong></div><div><span class="tiny-label">字段映射</span><strong>${s.mapping.id ? `v${s.mapping.version}${s.mappingDirty ? ' · 有修改' : ''}` : '尚未保存'}</strong></div><div><span class="tiny-label">标准 / 评测器</span><strong>${s.evaluator?.id ? `标准 v${s.evaluator.spec_version} / 评测器 v${s.evaluator.version}` : '尚未保存'}</strong></div></div><div class="selection-options">${[['selected', '选中的样本', `当前选择 ${s.selected.length} 条`], ['all', '全部记录', `共 ${s.dataset?.row_count || 0} 条，需要明确确认`]].map(([value, title, hint]) => `<label class="selection-card ${mode === value ? 'chosen' : ''}"><input type="radio" name="selection" data-bind="selectionMode" value="${value}" ${mode === value ? 'checked' : ''}><span><strong>${title}</strong><small>${hint}</small></span></label>`).join('')}</div>${mode === 'all' ? `<div class="toolbar">${checkbox('allConfirmed', s.allConfirmed, `我确认运行全部 ${s.dataset?.row_count || 0} 条记录。开发验证只选一条。`)}</div>` : ''}${!ready() ? '<div class="inline-note">请先保存字段映射、标准与评测器。</div>' : ''}<div class="panel-footer"><span>串行执行 · 逐条保存 · 支持取消与重试</span><div class="button-group">${button('trial', icon('lab') + '试评一条', '', !ready() || !previewRow())}${button('run', icon('play') + '开始评测', 'primary', !ready() || (mode === 'all' ? !s.allConfirmed : !s.selected.length))}</div></div>`, `<span class="mock-pill">${s.runMode === 'real' ? '真实模式' : '模拟模式'}</span>`);
     html += panel(`运行记录 <span class="count-tag">${s.catalog.runs.length}</span>`, '刷新和重启后仍可打开已保存的运行。', s.catalog.runs.length ? `<div class="run-list">${s.catalog.runs.map(r => `<button class="run-list-item ${s.run?.id === r.id ? 'selected' : ''}" data-action="load-run" data-id="${r.id}"><span class="run-icon">${icon('play')}</span><span><strong>${esc(r.spec_title)}</strong><small>${esc(r.dataset_name)} · ${new Date(r.created_at).toLocaleString('zh-CN')} · ${r.id.slice(-8)}</small></span>${badge(s.run?.id === r.id ? s.run.status : r.status)}${icon('arrow')}</button>`).join('')}</div>` : '<div class="empty-state"><h3>开始第一次试评</h3><p>先用一条记录检查输入、响应和结果。</p></div>', button('refresh-runs', icon('refresh') + '刷新'));
     if (s.run) {
       const r = s.run; const percent = Math.round(r.summary.processed / r.summary.selected * 100);
-      html += panel(`当前任务 ${badge(r.status)}`, r.id, `<div class="progress-label"><span>已处理 ${r.summary.processed} / ${r.summary.selected} 条</span><span>${percent}%</span></div><div class="progress-bar"><span style="width:${percent}%"></span></div><div class="status-counts">${Object.entries(r.summary.statuses).map(([k, v]) => `<span>${badge(k)} ${v}</span>`).join('')}</div>${r.error ? `<div class="message error">${esc(r.error)}</div>` : ''}`, `<div class="button-group">${active(r.status) ? button('cancel', '取消') : r.records.some(v => v.status !== 'completed') ? button('retry', icon('refresh') + '原配置重试') : ''}<button class="button primary" data-page="4">查看结果${icon('arrow')}</button></div>`);
+      html += panel(`当前任务 ${badge(r.status)}`, r.id, `<div class="progress-label"><span>已处理 ${r.summary.processed} / ${r.summary.selected} 条</span><span>${percent}%</span></div><div class="progress-bar"><span style="width:${percent}%"></span></div><div class="status-counts">${Object.entries(r.summary.statuses).map(([k, v]) => `<span>${badge(k)} ${v}</span>`).join('')}</div>${r.error ? `<div class="message error">${esc(r.error)}</div>` : ''}`, `<div class="button-group">${active(r.status) ? button('cancel', '取消') : r.records.some(v => v.status !== 'completed') ? button('retry', icon('refresh') + '原配置重试', '', !!r.archived_at) : ''}<button class="button primary" data-page="4">查看结果${icon('arrow')}</button></div>`);
     }
     return html;
   }
@@ -176,25 +188,42 @@
     if (!r) return panel('还没有评测结果', '先完成一次单条试评。', '<button class="button primary" data-page="3">前往执行任务</button>');
     const record = r.records[s.rowIndex]; const attempt = record?.attempts.at(s.attemptIndex);
     const source = r.snapshot.dataset.rows.find(v => v.row_id === record?.row_id);
-    let html = `<div class="result-toolbar">${select('runChoice', s.catalog.runs.map(v => [v.id, `${v.spec_title} · ${v.id.slice(-8)}`]), r.id, '选择运行结果')}${badge(r.status)}<span class="mock-pill">模拟运行 · 不代表真实质量</span></div><div class="verdict-stats">${Object.entries(r.summary.verdict_counts).map(([k, v]) => `<div class="verdict-stat ${k}"><span>${labels[k]}</span><strong>${v}</strong><small>标准判断次数</small></div>`).join('')}</div><p class="statistics-note">${esc(r.summary.denominator_note)}</p>`;
+    let html = `<div class="result-toolbar">${select('runChoice', s.catalog.runs.map(v => [v.id, `${v.spec_title} · ${v.id.slice(-8)}`]), r.id, '选择运行结果')}${badge(r.status)}<span class="mock-pill">${r.is_mock ? '模拟运行 · 不代表真实质量' : '真实运行'}${r.archived_at ? ' · 已归档，只读' : ''}</span></div><div class="verdict-stats">${Object.entries(r.summary.verdict_counts).map(([k, v]) => `<div class="verdict-stat ${k}"><span>${labels[k]}</span><strong>${v}</strong><small>标准判断次数</small></div>`).join('')}</div><p class="statistics-note">${esc(r.summary.denominator_note)}</p>`;
     let content = `<div class="result-context"><span class="mono">${esc(record.row_id)}</span>${badge(record.status)}<span>已尝试 ${record.attempts.length} 次</span>${record.attempts.length ? select('attemptIndex', record.attempts.map((a, i) => [i, `第 ${i + 1} 次 · ${labels[a.status] || a.status}`]), s.attemptIndex < 0 ? record.attempts.length - 1 : s.attemptIndex, '选择执行尝试') : ''}</div>`;
     if (attempt?.error) content += `<div class="message error">${esc(attempt.error)}</div>`;
     if (r.validation_case) content += `<div class="message loading">人工案例预期：${esc(r.validation_case.criterion_id)} = ${labels[r.validation_case.expected]}；当前判断：${esc(labels[attempt?.criteria.find(c => c.criterion_id === r.validation_case.criterion_id)?.verdict] || '暂无判断')}。标准版本变化后需重新确认适用性。</div>`;
-    content += attempt?.criteria.length ? `<div class="verdict-list">${attempt.criteria.map(c => `<article class="verdict-item"><div class="verdict-item-title"><code>${esc(c.criterion_id)}</code><strong>${esc(c.name)}</strong>${badge(c.verdict || '未映射')}<span class="source-label">${c.source === 'llm' ? 'LLM · 模拟' : c.source === 'evidence_check' ? '依据检查' : '内置规则'}</span></div><p>${esc(c.reason)}</p>${c.evidence.length ? `<blockquote>${esc(c.evidence.join('\n'))}</blockquote>` : ''}</article>`).join('')}</div>` : '<div class="empty-inline">暂无标准判定。技术异常不转换为内容不合格。</div>';
-    content += `<div class="details-grid">${details('original-record', '原始记录与已有输出', json(source?.original))}${details('raw-response', '实际请求与原始响应', json({ request: attempt?.request, raw_response: attempt?.raw_response, raw_output: attempt?.raw_output }))}${details('parsed-payload', '解析后的 JSON 载荷', json(attempt?.parsed))}${details('run-snapshot', '固定的运行配置', json({ mapping: r.snapshot.mapping, spec: r.snapshot.spec, evaluator: r.snapshot.evaluator }))}</div>`;
-    content += `<div class="subsection"><h3>人工复核</h3><p>修订追加保存，保留原始判断及对应的执行尝试。</p><div class="form-grid three">${field('标准', select('reviewCriterion', [['', '选择标准'], ...r.snapshot.spec.criteria.filter(c => c.enabled).map(c => [c.id, `${c.id} · ${c.name}`])], s.reviewCriterion))}${field('人工结论', select('reviewVerdict', verdicts.map(v => [v, labels[v]]), s.reviewVerdict))}${field('修订理由', input('reviewReason', s.reviewReason, 'text', 'placeholder="为什么修订或确认此判断"'))}</div><div class="toolbar">${checkbox('saveCase', s.saveCase, '保存为回归案例')}${s.saveCase ? checkbox('confirmHuman', s.confirmHuman, '我已独立人工确认，未把模拟判定当作正确答案') : ''}${button('review', icon('save') + '保存复核', 'primary', active(r.status) || !attempt || !s.reviewCriterion || !s.reviewReason.trim() || (s.saveCase && !s.confirmHuman))}</div>${record.reviews.length ? `<div class="review-history">${record.reviews.map(v => `<div><span class="human-tag">人工</span><code>${esc(v.criterion_id)}</code>${badge(v.verdict)}<span>${esc(v.reason)}</span><small>${new Date(v.created_at).toLocaleString('zh-CN')}</small></div>`).join('')}</div>` : ''}</div>`;
+    content += attempt?.criteria.length ? `<div class="verdict-list">${attempt.criteria.map(c => `<article class="verdict-item"><div class="verdict-item-title"><code>${esc(c.criterion_id)}</code><strong>${esc(c.name)}</strong>${badge(c.verdict || '未映射')}<span class="source-label">${c.source === 'llm' ? (attempt.is_mock ? 'LLM · 模拟' : 'LLM · 真实') : c.source === 'evidence_check' ? '依据检查' : '内置规则'}</span></div><p>${esc(c.reason)}</p>${c.evidence.length ? `<blockquote>${esc(c.evidence.join('\n'))}</blockquote>` : ''}</article>`).join('')}</div>` : '<div class="empty-inline">暂无标准判定。技术异常不转换为内容不合格。</div>';
+    content += `<div class="details-grid">${details('original-record', '原始记录与已有输出', json(source?.original))}${details('raw-response', '实际请求与原始响应', json({ request: attempt?.request, raw_response: attempt?.raw_response, raw_output: attempt?.raw_output, usage: attempt?.usage, latency_ms: attempt?.latency_ms, first_token_latency_ms: attempt?.first_token_latency_ms, model_called: attempt?.model_called }))}${details('parsed-payload', '解析后的 JSON 载荷', json(attempt?.parsed))}${details('run-snapshot', '固定的运行配置', json({ lineage: r.lineage, mapping: r.snapshot.mapping, spec: r.snapshot.spec, evaluator: r.snapshot.evaluator }))}</div>`;
+    content += `<div class="subsection"><h3>人工复核</h3><p>修订追加保存，保留原始判断及对应的执行尝试。</p><div class="form-grid three">${field('标准', select('reviewCriterion', [['', '选择标准'], ...r.snapshot.spec.criteria.filter(c => c.enabled).map(c => [c.id, `${c.id} · ${c.name}`])], s.reviewCriterion))}${field('人工结论', select('reviewVerdict', verdicts.map(v => [v, labels[v]]), s.reviewVerdict))}${field('修订理由', input('reviewReason', s.reviewReason, 'text', 'placeholder="为什么修订或确认此判断"'))}</div><div class="toolbar">${checkbox('saveCase', s.saveCase, '保存为回归案例')}${s.saveCase ? checkbox('confirmHuman', s.confirmHuman, '我已独立人工确认，未把模拟判定当作正确答案') : ''}${button('review', icon('save') + '保存复核', 'primary', r.archived_at || active(r.status) || !attempt || !s.reviewCriterion || !s.reviewReason.trim() || (s.saveCase && !s.confirmHuman))}</div>${record.reviews.length ? `<div class="review-history">${record.reviews.map(v => `<div><span class="human-tag">人工</span><code>${esc(v.criterion_id)}</code>${badge(v.verdict)}<span>${esc(v.reason)}</span><small>${new Date(v.created_at).toLocaleString('zh-CN')}</small></div>`).join('')}</div>` : ''}</div>`;
     html += panel('逐条结果与证据', `标准 v${r.snapshot.spec.version} · 评测器 v${r.snapshot.evaluator.version} · ${r.snapshot.dataset.filename}`, content, select('rowIndex', r.records.map((v, i) => [i, `${v.row_id.split(':').at(-1)} · ${labels[v.status] || v.status}`]), s.rowIndex, '选择结果样本'));
     html += panel('导出 XLSX', '原列与行序保留，评测列追加；未参与运行的行标记为未运行。', `<div class="export-options">${r.export_fields.length ? r.export_fields.map(path => `<label class="check-label"><input type="checkbox" data-export="${esc(path)}" ${s.exportFields.includes(path) ? 'checked' : ''}><code>${esc(path)}</code></label>`).join('') : '<span class="muted">无可展开载荷，仍可导出执行状态、标准判断与人工复核。</span>'}</div>`, button('export', icon('download') + '导出结果', 'primary', active(r.status)));
-    const cases = s.catalog.cases.length ? `<div class="case-list">${s.catalog.cases.map(c => `<div><div><strong>${esc(c.criterion_id)}</strong>${badge(c.expected)}<small>标准 v${c.spec_version} · 人工确认 · 来源为模拟运行</small><p>${esc(c.reason)}</p></div>${button('rerun-case', '复测此案例' + icon('arrow'), '', !s.evaluator?.id || s.evaluatorDirty, `data-id="${c.id}"`)}</div>`).join('')}</div>` : '<div class="empty-inline">独立人工确认后可保存案例。模拟结论本身不作为正确答案。</div>';
+    const cases = s.catalog.cases.length ? `<div class="case-list">${s.catalog.cases.map(c => `<div><div><strong>${esc(c.criterion_id)}</strong>${badge(c.expected)}<small>标准 v${c.spec_version} · 人工确认 · 来源：${c.source_run_is_mock ? '模拟' : '真实'}运行</small><p>${esc(c.reason)}</p></div>${button('rerun-case', '复测此案例' + icon('arrow'), '', !s.evaluator?.id || s.evaluatorDirty, `data-id="${c.id}"`)}</div>`).join('')}</div>` : '<div class="empty-inline">独立人工确认后可保存案例。模拟结论本身不作为正确答案。</div>';
     return html + panel('回归案例与复测', '使用当前已保存的评测器新建运行，历史记录保持不变。', cases, button('rerun', icon('refresh') + '同批样本复测', '', !s.evaluator?.id || s.evaluatorDirty));
+  }
+
+  async function loadHistory() {
+    s.historyItems = (await api(`/history?kind=${s.historyKind}&include_archived=${s.includeArchived}`)).items;
+    if (s.historyDetail) s.historyDetail = await api(`/history/${s.historyDetail.object.kind || 'run'}/${s.historyDetail.object.id}`);
+  }
+  function historyPage() {
+    const kinds = [['dataset', '数据集'], ['spec', '标准方案'], ['evaluator', '评测器'], ['run', '运行'], ['case', '案例'], ['design_call', '设计调用']];
+    let html = panel('历史对象', '已保存内容持久保留；未保存草稿刷新后丢失。归档包含整个对象的所有版本。', `<div class="toolbar">${field('类型', select('historyKind', kinds, s.historyKind))}${checkbox('includeArchived', s.includeArchived, '包含已归档对象')}${button('history-refresh', '刷新列表')}</div><div class="table-scroll"><table class="data-table"><thead><tr><th>名称 / ID</th><th>时间 / 版本</th><th>状态</th><th>保留引用</th><th>操作</th></tr></thead><tbody>${s.historyItems.map(v => `<tr><td>${esc(v.name)}<br><code>${esc(v.id)}</code></td><td>${esc(new Date(v.created_at).toLocaleString('zh-CN'))}<br>${v.version ? `v${v.version}` : '运行'}</td><td>${v.archived_at ? '已归档' : '未归档'} ${v.status ? badge(v.status) : ''}</td><td>${v.references.length}</td><td>${button('history-detail', '查看', '', false, `data-id="${esc(v.id)}" data-kind="${v.kind}"`)} ${button('history-lifecycle', v.archived_at ? '恢复' : '归档', '', !v.can_archive, `data-id="${esc(v.id)}" data-kind="${v.kind}" data-restore="${!!v.archived_at}"`)}</td></tr>`).join('')}</tbody></table></div>`);
+    const detail = s.historyDetail;
+    if (!detail) return html;
+    const v = detail.object; const kind = v.kind || 'run';
+    const selectable = ['dataset', 'spec', 'evaluator', 'run'].includes(kind) || (kind === 'design_call' && v.purpose === 'extract' && v.status === 'completed');
+    const owned = kind === 'dataset' ? '全部映射版本和导入副本' : kind === 'run' ? '运行详情、所有尝试、复核和所属导出文件' : '全部版本';
+    html += panel('对象详情与溯源', `${v.id} · ${v.archived_at ? '已归档，仅查看' : '未归档'}`, `<div class="toolbar">${selectable ? button('history-open', kind === 'design_call' ? '恢复候选为草稿' : '重新打开', 'primary', !!v.archived_at && kind !== 'run') : ''}${button('history-delete', '永久删除', '', active(v.status) || v.status === 'design_running', `data-id="${esc(v.id)}" data-kind="${kind}" data-owned="${esc(owned)}"`)}</div><p>永久删除范围：${esc(owned)}。存在保留引用时拒绝删除。</p>${details('history-refs', `引用此对象的记录（${detail.references.length}）`, json(detail.references))}${details('history-object', '对象内容 / 请求响应 / 版本快照', json(v))}${details('history-versions', '所有版本内容', json(detail.versions))}${details('history-events', '保存与生命周期操作记录', json(detail.events))}`);
+    return html;
   }
 
   function render() {
     const opened = [...document.querySelectorAll('details[open][id]')].map(node => node.id);
     const focus = document.activeElement?.getAttribute('data-bind');
     const selection = focus && typeof document.activeElement.selectionStart === 'number' ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
-    const pages = [dataPage, standardPage, evaluatorPage, executionPage, resultsPage];
-    root.innerHTML = `<div class="app-shell"><aside class="sidebar"><a class="brand" href="#" data-page="0"><span class="brand-mark">${icon('grid', 23)}</span><span>Eval Studio<small>LLM 评测工作台</small></span></a><div class="workspace-label">工作空间 <span>v0</span></div><nav aria-label="主要功能">${steps.map((v, i) => `<button class="nav-item ${s.page === i ? 'active' : ''}" data-page="${i}">${icon(i === 3 ? 'play' : 'grid')}<span>${v[0]}<small>${v[1]}</small></span></button>`).join('')}</nav><div class="sidebar-note">${icon('lab', 20)}<strong>v0 · 流程验证</strong><p>模型响应全部模拟。<br>每个判断都可以追溯。</p><span class="mini-dot"></span>不发送真实模型请求</div><a class="api-link" href="/api/v1/health" target="_blank" rel="noreferrer">服务状态与存储位置</a></aside><div class="main-shell"><header class="topbar"><div class="breadcrumb">工作空间 › <span>${steps[s.page][0]}</span></div><div class="topbar-right"><span class="connection ${s.online ? 'connected' : ''}"></span><span>${s.online ? '服务已连接' : '等待服务连接'}</span><span class="mock-pill">${icon('lab', 13)}模拟模式</span></div></header><main><div class="page-heading"><div><div class="eyebrow">EVALUATION WORKSPACE / 0${s.page + 1}</div><h1>${steps[s.page][0]}</h1><p>${steps[s.page][2]}</p></div><span class="version-tag">WORKBENCH v0</span></div><div class="flow-strip">${steps.map((v, i) => `<button class="${s.page === i ? 'current' : ''}" data-page="${i}"><span>${i + 1}</span>${v[0]}</button>`).join('')}</div>${s.busy ? `<div class="message loading">${esc(s.busy)}…</div>` : ''}${s.notice ? `<div class="message success">${icon('check')}<span>${esc(s.notice)}</span><button data-action="dismiss-notice" aria-label="关闭提示">×</button></div>` : ''}${s.error ? `<div class="message error"><div>${esc(s.error)}${s.errorTrace ? details('error-trace', '查看失败请求与响应', json(s.errorTrace)) : ''}</div><button data-action="dismiss-error" aria-label="关闭错误">×</button></div>` : ''}${pages[s.page]()}<footer class="app-footer"><span>Eval Studio · 每一步都可以检查，每个版本都有记录。</span><span>Python 服务 · 模拟模式</span></footer></main></div></div>`;
+    const pages = [dataPage, standardPage, evaluatorPage, executionPage, resultsPage, historyPage];
+    root.innerHTML = `<div class="app-shell"><aside class="sidebar"><a class="brand" href="#" data-page="0"><span class="brand-mark">${icon('grid', 23)}</span><span>Eval Studio<small>LLM 评测工作台</small></span></a><div class="workspace-label">工作空间 <span>v0</span></div><nav aria-label="主要功能">${steps.map((v, i) => `<button class="nav-item ${s.page === i ? 'active' : ''}" data-page="${i}">${icon(i === 3 ? 'play' : 'grid')}<span>${v[0]}<small>${v[1]}</small></span></button>`).join('')}</nav><div class="sidebar-note">${icon('lab', 20)}<strong>v0 · 流程验证</strong><p>各环节默认模拟。<br>每个判断都可以追溯。</p><span class="mini-dot"></span>按需切换真实调用</div><a class="api-link" href="/api/v1/health" target="_blank" rel="noreferrer">服务状态与存储位置</a></aside><div class="main-shell"><header class="topbar"><div class="breadcrumb">工作空间 › <span>${steps[s.page][0]}</span></div><div class="topbar-right"><span class="connection ${s.online ? 'connected' : ''}"></span><span>${s.online ? '服务已连接' : '等待服务连接'}</span><span class="mock-pill">${icon('lab', 13)}${s.llmStatus.configured ? '真实连接已配置' : '模拟可用'}</span></div></header><main><div class="page-heading"><div><div class="eyebrow">EVALUATION WORKSPACE / 0${s.page + 1}</div><h1>${steps[s.page][0]}</h1><p>${steps[s.page][2]}</p></div><span class="version-tag">WORKBENCH v0</span></div><div class="flow-strip">${steps.slice(0, 5).map((v, i) => `<button class="${s.page === i ? 'current' : ''}" data-page="${i}"><span>${i + 1}</span>${v[0]}</button>`).join('')}</div>${s.busy ? `<div class="message loading">${esc(s.busy)}…</div>` : ''}${s.notice ? `<div class="message success">${icon('check')}<span>${esc(s.notice)}</span><button data-action="dismiss-notice" aria-label="关闭提示">×</button></div>` : ''}${s.error ? `<div class="message error"><div>${esc(s.error)}${s.errorTrace ? details('error-trace', '查看失败请求与响应', json(s.errorTrace)) : ''}</div><button data-action="dismiss-error" aria-label="关闭错误">×</button></div>` : ''}${pages[s.page]()}<footer class="app-footer"><span>Eval Studio · 每一步都可以检查，每个版本都有记录。</span><span>Python 服务 · 按环节选择模式</span></footer></main></div></div>`;
+    syncControls();
     for (const id of opened) { const node = document.getElementById(id); if (node) node.open = true; }
     if (focus) {
       const node = [...root.querySelectorAll('[data-bind]')].find(node => node.dataset.bind === focus);
@@ -203,20 +232,51 @@
   }
 
   const actions = {
+    'history-refresh': loadHistory,
+    'history-detail': async el => { s.historyDetail = await api(`/history/${el.dataset.kind}/${el.dataset.id}`); },
+    'history-lifecycle': async el => {
+      await api(`/history/${el.dataset.kind}/${el.dataset.id}/${el.dataset.restore === 'true' ? 'restore' : 'archive'}`, 'POST');
+      await refresh(); await loadHistory();
+      for (const value of [s.dataset, s.savedSpec, s.evaluator, s.run]) if (value?.id === el.dataset.id) value.archived_at = el.dataset.restore === 'true' ? null : new Date().toISOString();
+    },
+    'history-delete': async el => {
+      if (!window.confirm(`永久删除 ${el.dataset.id}？\n范围：${el.dataset.owned}。\n此操作不可恢复，存在引用将拒绝。`)) return;
+      const result = await api(`/history/${el.dataset.kind}/${el.dataset.id}`, 'DELETE', { confirm_id: el.dataset.id });
+      if (s.dataset?.id === el.dataset.id) { s.dataset = null; s.rows = []; s.selected = []; s.mapping = { inputs: [], outputs: [], references: [] }; s.mappingDirty = true; }
+      if (s.savedSpec?.id === el.dataset.id) actions['new-spec']();
+      if (s.evaluator?.id === el.dataset.id) { s.evaluator = null; s.evaluatorDirty = true; }
+      if (s.run?.id === el.dataset.id) s.run = null;
+      s.historyDetail = null; await refresh(); await loadHistory();
+      s.notice = result.file_cleanup_pending ? '对象已删除，但所属暂存文件清理未完成，请检查数据目录 .deleting。' : '对象及所属文件已删除。';
+    },
+    'history-open': async () => {
+      const v = s.historyDetail.object; const kind = v.kind || 'run';
+      if (kind === 'dataset') { await loadDataset(v); s.page = 0; }
+      else if (kind === 'spec') { loadSpec(v); s.page = 1; }
+      else if (kind === 'evaluator') { loadSpec(await api(`/entities/${v.spec_id}?version=${v.spec_version}`)); loadEvaluator(v); s.page = 2; }
+      else if (kind === 'run') { await loadRun(v.id); s.page = 4; }
+      else if (kind === 'design_call') {
+        actions['new-spec'](); s.generationPrompt = v.input_snapshot?.generation_prompt || '';
+        s.criteria = v.result.criteria.map(c => ({ ...c, schemaText: pretty(c.rule_schema) }));
+        s.designCallIds = [v.id]; s.traces = [{ design_call_id: v.id, execution_mode: v.execution_mode }]; s.page = 1;
+        s.notice = '候选已恢复为未保存草稿，保存后才创建标准版本。';
+      }
+    },
+    'compare-versions': async el => { s.compareResult = await api(`/entities/${el.dataset.id}/compare?left=${Number(s.compareLeft || el.dataset.left)}&right=${Number(s.compareRight || el.dataset.right)}`); },
     demo: async () => { const row = { sample_id: 'DEMO-001', task_input: { instruction: '用一句话概括参考内容。', material: '该工具用于导入已有输出、配置评测标准并查看结果。' }, generated_output: '这是一条模拟已有输出，用于验证评测流程。', reference: '评测对象为已有输出。', provenance: { is_mock: true, note: '流程演示，不是人工确认答案。' } }; await importFile(new File([pretty([row])], 'demo_one_record.json', { type: 'application/json' }), true); },
     import: () => importFile(s.file),
     previous: () => loadDataset(s.dataset, Math.max(0, s.offset - 50)),
     next: () => loadDataset(s.dataset, s.offset + 50),
     'save-mapping': async () => { s.mapping = await api('/mappings', 'POST', { id: s.mapping.id, dataset_id: s.dataset.id, inputs: s.mapping.inputs, outputs: s.mapping.outputs, references: s.mapping.references }); s.mappingDirty = false; await refresh(); s.notice = `映射 v${s.mapping.version} 已保存。`; },
-    'new-spec': () => { s.savedSpec = null; s.title = '新的评测方案'; s.generationPrompt = ''; s.designNotes = ''; s.criteria = [criterion('C001')]; s.traces = []; s.analysis = null; s.specDirty = true; s.specVersions = []; },
+    'new-spec': () => { s.savedSpec = null; s.title = '新的评测方案'; s.generationPrompt = ''; s.designNotes = ''; s.criteria = [criterion('C001')]; s.traces = []; s.designCallIds = []; s.analysis = null; s.specDirty = true; s.specVersions = []; },
     'add-criterion': () => { let n = s.criteria.length + 1; while (s.criteria.some(c => c.id === `C${String(n).padStart(3, '0')}`)) n++; s.criteria.push(criterion(`C${String(n).padStart(3, '0')}`)); s.specDirty = true; },
     'delete-criterion': el => { s.criteria.splice(Number(el.dataset.index), 1); s.specDirty = true; },
-    'save-spec': async () => { const criteria = s.criteria.map(({ schemaText, ...c }) => ({ ...c, rule_schema: c.method === 'json_schema' ? JSON.parse(schemaText) : c.rule_schema })); loadSpec(await api('/specs', 'POST', { id: s.savedSpec?.id, title: s.title, generation_prompt: s.generationPrompt, design_notes: s.designNotes, criteria, design_traces: s.traces })); await refresh(); s.notice = `标准 v${s.savedSpec.version} 已保存。评测器仍使用其原绑定版本，可重新构建。`; },
-    extract: async () => { const value = await api('/specs/extract', 'POST', { generation_prompt: s.generationPrompt, mock_response: s.extractMock || null }); s.criteria = value.criteria.map(c => ({ ...c, schemaText: pretty(c.rule_schema) })); s.traces.push(value.trace); s.specDirty = true; s.notice = value.notice; },
-    analyze: async () => { s.analysis = await api('/evidence/analyze', 'POST', { mapping_id: s.mapping.id, mapping_version: s.mapping.version, spec_id: s.savedSpec.id, spec_version: s.savedSpec.version, row_id: previewRow(), mock_response: s.analysisMock || null }); s.traces.push(s.analysis.trace); s.specDirty = true; s.notice = '依据分析已完成，可修改标准或备注并再次保存。'; },
+    'save-spec': async () => { const criteria = s.criteria.map(({ schemaText, ...c }) => ({ ...c, rule_schema: c.method === 'json_schema' ? JSON.parse(schemaText) : c.rule_schema })); loadSpec(await api('/specs', 'POST', { id: s.savedSpec?.id, title: s.title, generation_prompt: s.generationPrompt, design_notes: s.designNotes, criteria, design_call_ids: s.designCallIds, design_traces: s.traces })); await refresh(); s.notice = `标准 v${s.savedSpec.version} 已保存。评测器仍使用其原绑定版本，可重新构建。`; },
+    extract: async () => { const value = await api('/specs/extract', 'POST', { generation_prompt: s.generationPrompt, mock_response: s.extractMock || null, execution_mode: s.extractMode }); s.criteria = value.criteria.map(c => ({ ...c, schemaText: pretty(c.rule_schema) })); s.traces.push(value.trace); s.designCallIds.push(value.design_call_id); s.specDirty = true; s.notice = value.notice; },
+    analyze: async () => { s.analysis = await api('/evidence/analyze', 'POST', { mapping_id: s.mapping.id, mapping_version: s.mapping.version, spec_id: s.savedSpec.id, spec_version: s.savedSpec.version, row_id: previewRow(), mock_response: s.analysisMock || null, execution_mode: s.analysisMode }); s.traces.push(s.analysis.trace); s.designCallIds.push(s.analysis.design_call_id); s.specDirty = true; s.notice = '依据分析已完成，可修改标准或备注并再次保存。'; },
     build: async () => { const value = await api('/evaluators/build', 'POST', { spec_id: s.savedSpec.id, spec_version: s.savedSpec.version }); if (s.evaluator?.id && s.evaluator.spec_id === value.spec_id) value.id = s.evaluator.id; loadEvaluator(value); s.evaluatorDirty = true; s.notice = '评测器草稿已构建，编辑并保存后继续。'; },
-    'save-evaluator': async () => { const value = { ...s.evaluator, response_schema: JSON.parse(s.schemaText), projection: JSON.parse(s.projectionText), config: { ...s.evaluator.config, parameters: JSON.parse(s.parametersText) }, mock_response: s.evaluator.mock_response || null }; loadEvaluator(await api('/evaluators', 'POST', value)); await refresh(); s.notice = `评测器 v${s.evaluator.version} 已保存。`; },
-    preview: async () => { requireReady(); s.preview = await api('/requests/preview', 'POST', { mapping_id: s.mapping.id, mapping_version: s.mapping.version, evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version, row_id: previewRow() }); },
+    'save-evaluator': async () => { const value = { ...s.evaluator, response_schema: JSON.parse(s.schemaText), projection: JSON.parse(s.projectionText), mock_response: s.evaluator.mock_response || null }; loadEvaluator(await api('/evaluators', 'POST', value)); await refresh(); s.notice = `评测器 v${s.evaluator.version} 已保存。`; },
+    preview: async () => { requireReady(); s.preview = await api('/requests/preview', 'POST', { mapping_id: s.mapping.id, mapping_version: s.mapping.version, evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version, row_id: previewRow(), execution_mode: s.runMode }); },
     'spec-versions': async () => { s.specVersions = await api(`/entities/${s.savedSpec.id}/versions`); },
     'evaluator-versions': async () => { s.evaluatorVersions = await api(`/entities/${s.evaluator.id}/versions`); },
     'load-version': async el => { const isSpec = el.dataset.type === 'spec'; const id = isSpec ? s.savedSpec.id : s.evaluator.id; const value = await api(`/entities/${id}?version=${Number(el.dataset.version)}`); if (isSpec) loadSpec(value); else loadEvaluator(value); },
@@ -228,8 +288,8 @@
     retry: async () => { await api(`/runs/${s.run.id}/retry`, 'POST'); await loadRun(s.run.id); await refresh(); },
     review: async () => { const record = s.run.records[s.rowIndex]; await api(`/runs/${s.run.id}/rows/${encodeURIComponent(record.row_id)}/review`, 'POST', { criterion_id: s.reviewCriterion, verdict: s.reviewVerdict, reason: s.reviewReason, save_case: s.saveCase, confirm_mock: s.confirmHuman }); await loadRun(s.run.id); await refresh(); s.reviewReason = ''; s.saveCase = false; s.confirmHuman = false; s.notice = '人工复核已追加保存，原判断未覆盖。'; },
     export: exportRun,
-    rerun: async () => { const value = await api(`/runs/${s.run.id}/rerun`, 'POST', { evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version }); await loadRun(value.id); await refresh(); s.page = 3; },
-    'rerun-case': async el => { const value = await api(`/cases/${el.dataset.id}/rerun`, 'POST', { evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version }); await loadRun(value.id); await refresh(); s.page = 3; },
+    rerun: async () => { const value = await api(`/runs/${s.run.id}/rerun`, 'POST', { evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version, execution_mode: s.runMode }); await loadRun(value.id); await refresh(); s.page = 3; },
+    'rerun-case': async el => { const value = await api(`/cases/${el.dataset.id}/rerun`, 'POST', { evaluator_id: s.evaluator.id, evaluator_version: s.evaluator.version, execution_mode: s.runMode }); await loadRun(value.id); await refresh(); s.page = 3; },
   };
 
   function bind(target) {
@@ -240,18 +300,22 @@
     for (const key of keys.slice(0, -1)) object = object[key];
     object[keys.at(-1)] = value;
     if (path.startsWith('criteria.') || ['title', 'generationPrompt', 'designNotes'].includes(path)) s.specDirty = true;
-    if (path.startsWith('evaluator.') || ['schemaText', 'projectionText', 'parametersText'].includes(path)) { s.evaluatorDirty = true; s.preview = null; }
+    if (path.startsWith('evaluator.') || ['schemaText', 'projectionText'].includes(path)) { s.evaluatorDirty = true; s.preview = null; }
   }
   function syncControls() {
     const record = s.run?.records[s.rowIndex];
     const disabled = {
-      extract: !s.generationPrompt.trim(),
-      analyze: !s.savedSpec || s.specDirty || !s.mapping.id || s.mappingDirty || !previewRow(),
-      build: !s.savedSpec || s.specDirty,
-      preview: !ready() || !previewRow(),
-      trial: !ready() || !previewRow(),
-      run: !ready() || (s.selectionMode === 'all' ? !s.allConfirmed : !s.selected.length),
-      review: !s.run || active(s.run.status) || !record?.attempts.length || !s.reviewCriterion || !s.reviewReason.trim() || (s.saveCase && !s.confirmHuman),
+      'save-mapping': !s.mapping.outputs.length || !!s.dataset?.archived_at,
+      'save-spec': !s.criteria.length || !!s.savedSpec?.archived_at,
+      'save-evaluator': !!s.evaluator?.archived_at || !!s.savedSpec?.archived_at,
+      rerun: !s.evaluator?.id || s.evaluatorDirty || !!s.evaluator?.archived_at || !!s.run?.archived_at || !canCall(s.runMode),
+      extract: !s.generationPrompt.trim() || !canCall(s.extractMode),
+      analyze: !s.savedSpec || s.savedSpec.archived_at || s.dataset?.archived_at || s.specDirty || !s.mapping.id || s.mappingDirty || !previewRow() || !canCall(s.analysisMode),
+      build: !s.savedSpec || s.savedSpec.archived_at || s.specDirty,
+      preview: !ready() || !previewRow() || !canCall(s.runMode),
+      trial: !ready() || !previewRow() || !canCall(s.runMode),
+      run: !ready() || !canCall(s.runMode) || (s.selectionMode === 'all' ? !s.allConfirmed : !s.selected.length),
+      review: !s.run || s.run.archived_at || active(s.run.status) || !record?.attempts.length || !s.reviewCriterion || !s.reviewReason.trim() || (s.saveCase && !s.confirmHuman),
     };
     for (const node of document.querySelectorAll('button[data-action]')) {
       if (Object.hasOwn(disabled, node.dataset.action)) node.disabled = Boolean(s.busy || disabled[node.dataset.action]);
@@ -272,14 +336,14 @@
     if (d.row) s.selected = target.checked ? [...new Set([...s.selected, d.row])] : s.selected.filter(v => v !== d.row);
     if (d.criterionRole) { const c = s.criteria[Number(d.index)]; c.required_roles = c.required_roles.filter(v => v !== d.criterionRole); if (target.checked) c.required_roles.push(d.criterionRole); s.specDirty = true; }
     if (d.export !== undefined) s.exportFields = target.checked ? [...new Set([...s.exportFields, d.export])] : s.exportFields.filter(v => v !== d.export);
-    bind(target); if (d.bind === 'rowIndex') { s.attemptIndex = -1; s.reviewCriterion = ''; s.reviewReason = ''; }
+    bind(target); if (['historyKind', 'includeArchived'].includes(d.bind)) { s.historyDetail = null; await action('读取历史', loadHistory); return; } if (d.bind === 'runMode') s.preview = null; if (d.bind === 'rowIndex') { s.attemptIndex = -1; s.reviewCriterion = ''; s.reviewReason = ''; }
     // Replacing a button during a text field's blur/change can cancel its click.
     // Text edits update state and button availability without rebuilding the DOM.
     if (target.tagName === 'SELECT' || ['checkbox', 'radio'].includes(target.type)) render(); else syncControls();
   });
   document.addEventListener('click', async event => {
     const nav = event.target.closest?.('[data-page]');
-    if (nav) { event.preventDefault(); s.page = Number(nav.dataset.page); render(); return; }
+    if (nav) { event.preventDefault(); s.page = Number(nav.dataset.page); if (s.page === 5) await action('读取历史', loadHistory); else render(); return; }
     const el = event.target.closest?.('[data-action]');
     if (!el || el.disabled) return;
     event.preventDefault();
@@ -293,7 +357,7 @@
 
   render();
   action('连接工作台', async () => {
-    await api('/health'); s.online = true; await refresh();
+    await api('/health'); s.online = true; s.llmStatus = await api('/llm/status'); await refresh();
     const pick = (values, key) => values.find(v => v.id === localStorage.getItem('eval.' + key)) || values[0];
     const ds = pick(s.catalog.datasets, 'dataset'); if (ds) await loadDataset(ds);
     const sp = pick(s.catalog.specs, 'spec'); if (sp) loadSpec(sp);

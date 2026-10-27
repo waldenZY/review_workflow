@@ -5,6 +5,7 @@ __pycache__/
 venv/
 .env
 .env.*
+/config/llm_config.local.json
 
 # Local datasets, runs, exports, and application state.
 /data/

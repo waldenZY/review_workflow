@@ -1,70 +1,74 @@
-# Linux 部署：直接运行源码
+# Eval Studio v1：Python 源码部署
 
-## 环境与文件
+## 环境和启动
 
-服务器需要 Python 3.10+、pip 和可写的数据目录。环境名称不限，moto 只用于当前 Windows 机器的本地调试。
+需要 Python 3.10+、pip 和可写的数据目录。环境名称不限，moto 只约束当前 Windows 本地调试。前端由浏览器直接执行，没有 Node.js、npm、前端构建或专用发布包。
 
-前端为浏览器直接执行的 HTML、CSS、JavaScript，后端为 FastAPI。开发、修改页面和服务器运行均没有前端构建步骤，不需要 Node.js、npm、React 或专用发布包。
-
-直接复制项目或拉取源码即可，保留 backend/、frontend/、scripts/start.py 和 requirements.txt。frontend/ 只包含 index.html、app.js、style.css，均为需要版本管理的源码。不要复制本地 Python 虚拟环境或运行数据来替代服务器环境安装。
-
-## 安装与启动
-
-在服务器选定的 Python 环境中执行：
+复制完整源码，保留 backend/、frontend/、scripts/、config/、docs/ 和 requirements.txt。运行依赖统一一份清单，包括 Markdown 帮助渲染；没有 pytest 依赖或自动测试套件。
 
 ```bash
 cd review_workflow
-python --version
+python3 -m venv .venv
+. .venv/bin/activate
 python -m pip install -r requirements.txt
 python scripts/start.py --host 0.0.0.0 --port 8000 --data-dir "$HOME/eval-studio-data"
 ```
 
-没有独立环境时，可先使用 `python3 -m venv .venv` 和 `. .venv/bin/activate` 准备环境。依赖清单只有一份，httpx 用于真实模型调用，pytest 用于测试。pip 需要可用的 Python 包源，当前不提供离线依赖集合。
+也可在任意目录执行 `/path/to/python /path/to/review_workflow/scripts/start.py ...`。浏览器访问服务器地址同一端口，页面、API、帮助由同一 Python 服务提供。
 
-浏览器打开 `http://服务器地址:8000`。Python 在同一地址提供页面、`/static` 资源及 `/api/v1` 接口；接口文档位于 `/docs`，健康检查位于 `/api/v1/health`。没有额外前端服务或开发代理端口。
-
-## 参数与数据
-
-| 参数 | 行为 |
+| 设置 | 默认及含义 |
 | --- | --- |
-| `--host` | 默认 127.0.0.1；服务器直接访问可显式使用 0.0.0.0 |
-| `--port` | 默认 8000，可指定 1024–65535 |
-| `--data-dir` | 指定可写数据目录，优先于环境变量 EVAL_DATA_DIR |
-| 未指定数据目录 | 使用应用目录同级的 review_workflow_data/，不依赖启动时的工作目录 |
+| --host | 127.0.0.1；服务器访问可显式设 0.0.0.0 |
+| --port | 8000，可设 1024–65535 |
+| --data-dir | 实际数据目录，优先于进程环境变量 EVAL_DATA_DIR |
+| 未指定数据目录 | 项目仓库同级的 review_workflow_data/，不依赖启动工作目录 |
 
-允许从任意目录执行 `python /path/to/review_workflow/scripts/start.py ...`。缺少三个前端文件中的任何一个时，启动入口会明确报错。
+单进程、单工作队列运行，不开启多个 Uvicorn worker。工具无登录系统，适用于受控内网单用户使用。
 
-SQLite、导入副本和导出产物在数据目录中。更新程序时保留数据目录，替换源码并重启；原始测试资料继续位于项目外部。修改页面源码后刷新浏览器即可，修改后端后重启服务。
+## 全局模型连接
 
-当前采用单进程、单队列，不开启多个 Uvicorn worker。v0 是无登录的单用户工具，适用于受控内网；进程常驻方式可沿用服务器已有管理工具。
-
-## 可选：真实模型配置
+页面可填写并保存配置，不必登录服务器编辑。也可在服务器手动准备：
 
 ```bash
 cp config/llm_config.example.json config/llm_config.local.json
-# 编辑本项目的完整地址、密钥和参数，然后重启 Python 服务
+# 编辑为本项目自己的八个参数和凭证，然后启动或重启服务
 ```
 
-配置路径固定相对于项目根目录，不受启动工作目录影响。示例不含可用凭证；local 文件被 Git 忽略，请在服务器保留自己的文件。程序不读取 project1 配置、不自动读取 .env，也不提供网页密钥接口。
+固定相对于应用根目录读取 `config/llm_config.local.json`，不读取 .env，也不读取 project1 的配置。Local 文件不纳入 Git；示例只有占位值，没有可用凭证。
 
-| 字段 | 含义 |
-| --- | --- |
-| api_url | 完整 HTTP(S) Chat Completions 调用地址，不自动追加路径 |
-| api_key | 仅后端使用的 Bearer 凭证 |
-| model | 供应商支持的模型标识 |
-| max_tokens | 正整数，单次输出 Token 上限 |
-| timeout | 有限正数，httpx 网络操作超时秒数 |
-| stream | 布尔值；false 接收普通 JSON，true 解析 SSE |
-| enable_thinking / skip_special_tokens | 布尔值，按 project1 协议放在请求的 extra_body 对象内 |
+八字段：api_url、api_key、model、max_tokens、timeout、stream、enable_thinking、skip_special_tokens。api_url 为完整调用地址，不自动追加路径，不嵌入用户名密码；Bearer 密钥只放 api_key。后两个参数按既定协议放在 extra_body 对象内，需供应商支持。不自动加 response_format。
 
-八个字段必须完整提供，不能添加其它字段。启动时校验并固定到进程内；更改后必须重启，网页刷新不会重新读取配置。不自动增加 response_format，结果通过 Prompt 和本地 Schema 约束；请核对你的供应商是否支持这些参数。
+页面保存先校验再原子写入，成功后热加载，影响所有项目的新调用。手动编辑文件需要重启才生效。对已提交任务，开始时捕获的连接不会因全局设置变化而改变；密钥只保存在内存和本地配置文件，不进入数据库、页面响应或导出。
 
-`/api/v1/llm/status` 仅返回脱敏状态。真实地址只记录 SHA256；公开配置指纹包含地址哈希及公开参数，排除密钥。仅更换密钥不影响旧运行重试，模型、地址或公开参数变化会阻止原配置重试，应在页面选择模式后新建复测。没有配置或配置错误仍可使用模拟模式，不发起启动探测。
+GET `/api/v1/llm/config`、`/api/v1/llm/status` 返回无密钥的状态和公开参数。PUT `/api/v1/llm/config` 保存配置；POST `/api/v1/llm/clear-key` 清除密钥；POST `/api/v1/llm/test` 使用提交的设置短请求测试，不保存。保存、启动和刷新均不自动探测模型。
 
-SQLite 采用增量建表，保留已有记录和快照。升级前可停服务备份整个数据目录；恢复时保留 SQLite、imports 和 runs。历史归档只是隐藏整个对象，仍可查看和恢复；永久删除受引用保护，只清理所属数据目录内的文件，操作时间留在审计记录中。
+缺少或非法配置不阻止项目管理、数据导入、编辑、静态预览和帮助，也不阻止纯程序规则。真实模型操作会明确失败，不自动重试或降级。
 
-## 验证边界
+## v1 持久化和旧数据
 
-Python 测试直接复制后端、启动脚本及真实前端源码，在 PATH 不包含 Node.js、工作目录位于应用之外的情况下启动服务，检查 HTML、JavaScript、CSS、API 及独立数据目录。整个过程不构建页面、不生成专用发布包，不读取外部业务测试数据。
+```text
+数据目录/
+  workbench_v1.sqlite3
+  projects/
+    project_<id>/
+      imports/
+      runs/
+        run_<id>/
+          export_<id>.xlsx 或 .jsonl
+          export_<id>.manifest.json
+  .deleting/  # 删除暂存目录，正常清理后为空
+```
 
-当前尚未连接实际 Linux 服务器，也未完成真实浏览器视觉验收。自动测试对真实调用分支使用模拟网络，不读取业务测试集。真实服务的鉴权、兼容性及评测质量由用户填写本项目配置后单条试评验收，程序不会自动调用其它项目的服务。
+v1 从全新数据库开始，不迁移、读取或兼容旧 `workbench.sqlite3`，也不自动删除旧数据库、imports/、runs/ 等目录。可以沿用数据目录而不会覆盖旧库，但旧数据不会显示在 v1 页面。全局八字段模型文件仍是独立配置文件。
+
+项目归属在数据库和接口中校验，业务接口位于 `/api/v1/projects/{project_id}/…`。项目归档后可查看和导出，恢复后才能修改执行。删除项目按名称确认整体清理，单个对象删除仍受引用保护；有未结束任务时不允许归档或删除项目。
+
+导出清单只含格式、列选择、公开模型信息等，不另存完整业务快照。SQLite 保存运行快照和逐次尝试，可从页面历史溯源。
+
+升级源码时保留配置文件和数据目录。备份应停止服务后复制整个数据目录，同时单独保管本地模型配置。服务重启将未完成任务及设计调用标记中断，由用户决定重新发起或原配置重试。公开模型指纹变化时不能原配置重试，仅轮换密钥不改变指纹。
+
+## 帮助与验证
+
+`/help/tutorial`、`/help/deployment` 服务端渲染仓库内 Markdown，支持目录、表格和代码块；页面侧边面板使用同一来源，不依赖外部 CDN。更新 docs/ 后重新打开帮助即可。只提供这两个白名单帮助页面，不开放任意路径读取。
+
+部署检查可人工查看首页、静态资源、`/api/v1/health`、`/docs` 和帮助。功能验收只用一条记录；真实服务由用户配置后主动单条试评。当前 Linux 服务器和真实模型兼容性不能由 Windows 本地静态检查代替，实际完成范围见 [使用教程](使用教程.md) 和仓库内 v1 验收记录。

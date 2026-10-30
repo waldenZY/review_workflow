@@ -54,7 +54,7 @@ def parse_file(filename, content, sheet=None, header_row=1):
     if suffix not in ('.jsonl', '.json', '.xlsx'):
         raise ValueError('仅支持 JSONL、JSON、XLSX，不支持 CSV。')
     if len(content) > 25 * 1024 * 1024:
-        raise ValueError('v0 单文件最大 25 MB。')
+        raise ValueError('单文件最大 25 MB。')
     sources = []
     sheet_name = None
     if suffix in ('.json', '.jsonl'):

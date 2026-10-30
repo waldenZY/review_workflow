@@ -83,6 +83,10 @@ class EvaluatorSave(BuildRequest):
     output_example: dict[str, Any] | None = None
 
 
+class EvaluatorBuildRequest(BuildRequest):
+    source: EvaluatorSave | None = None
+
+
 class ContextRequest(Input):
     mapping_id: str
     mapping_version: int = Field(ge=1)

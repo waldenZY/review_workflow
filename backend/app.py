@@ -13,12 +13,12 @@ from jsonschema.exceptions import SchemaError
 from openpyxl import load_workbook
 
 from .data_io import MISSING, at, fields_for, parse_file, write_xlsx
-from .engine import (Runner, check_schema, default_evaluator, export_records, messages_for,
+from .engine import (Runner, check_schema, export_records, messages_for,
                      output_example, progress, project_criteria, shared_fields,
-                     validate_output_contract, validate_templates)
+                     rebuild_evaluator, validate_output_contract, validate_templates)
 from .history import History
 from .llm import Gateway, GatewayError, ModelSettings, decode_output, parse_output
-from .models import (AnalysisRequest, BuildRequest, ConnectionTest, Criterion, DraftPreviewRequest, EvaluatorSave,
+from .models import (AnalysisRequest, ConnectionTest, Criterion, DraftPreviewRequest, EvaluatorBuildRequest, EvaluatorSave,
                      ExportRequest, ExtractRequest, MappingSave, ObjectDelete, PreviewRequest,
                      ProfileSave, ProjectDelete, ProjectSave, RerunRequest, RunRequest, SpecSave)
 from .store import BUSY, Conflict, Store, dumps, now, uid
@@ -363,10 +363,28 @@ def create_app(data_dir=None, llm_config_path=None):
         return design_call(project_id, 'evidence_analysis', messages, validate, refs,
                            {'row_id': row['row_id'], 'fields': shared_fields(mapping, row), 'spec_snapshot': spec})
 
+    @router.get('/evaluators/matching')
+    def matching_evaluators(project_id: str, spec_id: str, spec_version: int):
+        with store().lock:
+            store().get(project_id, spec_id, spec_version, 'spec', True)
+            values = store().entities(project_id, 'evaluator', all_versions=True)
+            keys = ('id', 'version', 'title', 'created_at', 'spec_id', 'spec_version')
+            return {'items': [{k: v[k] for k in keys} for v in values if v['spec_id'] == spec_id and v['spec_version'] == spec_version]}
+
     @router.post('/evaluators/build')
-    def build(project_id: str, body: BuildRequest):
-        value = default_evaluator(store().get(project_id, body.spec_id, body.spec_version, 'spec', True))
-        return {**value, 'example_preview': output_example(value['response_schema'])}
+    def build(project_id: str, body: EvaluatorBuildRequest):
+        with store().lock:
+            spec = store().get(project_id, body.spec_id, body.spec_version, 'spec', True)
+            if body.source is None:
+                return rebuild_evaluator(spec)
+            if body.source.spec_id != spec['id']:
+                raise ValueError('自动同步只接受同一标准方案的来源草稿。')
+            old_spec = store().get(project_id, body.source.spec_id, body.source.spec_version, 'spec', True)
+            if body.source.id:
+                old_evaluator = store().get(project_id, body.source.id, kind='evaluator', active=True)
+                if old_evaluator['spec_id'] != spec['id']:
+                    raise ValueError('来源评测器不属于该标准方案。')
+            return rebuild_evaluator(spec, old_spec, body.source.model_dump())
 
     @router.post('/evaluators')
     def save_evaluator(project_id: str, body: EvaluatorSave):

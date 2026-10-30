@@ -157,6 +157,31 @@ def default_evaluator(spec):
         'output_example': None}
 
 
+def rebuild_evaluator(spec, source_spec=None, source=None):
+    """Prepare a draft without saving; preserve authored messages and custom return formats."""
+    value = default_evaluator(spec)
+    notes = []
+    if source is not None:
+        previous = default_evaluator(source_spec)
+        for key in ('system_template', 'user_template'):
+            value[key] = source[key]
+        if source['title'] != previous['title']:
+            value['title'] = source['title']
+        if source.get('id'):
+            value['id'] = source['id']
+        if source['response_schema'] != previous['response_schema'] or source['projection'] != previous['projection']:
+            for key in ('response_schema', 'projection'):
+                value[key] = copy.deepcopy(source[key])
+            notes.append('自定义 Schema 和映射已保留，请核对它们是否适用于当前标准；保存时仍会校验。')
+        value['output_example'] = copy.deepcopy(source.get('output_example'))
+    try:
+        example = output_example(value['response_schema'], value['output_example'])
+    except ValueError as exc:
+        example = {'value': None, 'message': str(exc)}
+        notes.append('手动结构示例已保留，请按当前返回结构修正。')
+    return {**value, 'example_preview': example, 'sync_notice': ' '.join(notes)}
+
+
 def project_criteria(parsed, spec, evaluator):
     projections = {p['criterion_id']: p for p in evaluator['projection']}
     results = []

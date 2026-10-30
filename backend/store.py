@@ -1,4 +1,4 @@
-"""The v1 database is independent of v0. Every business lookup requires a project."""
+"""The v1.1 database is independent of prior business data. All lookups require a project."""
 import copy
 import json
 import sqlite3
@@ -34,7 +34,7 @@ class Store:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(self.root / 'workbench_v1.sqlite3', check_same_thread=False)
+        self.db = sqlite3.connect(self.root / 'workbench_v1_1.sqlite3', check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, body TEXT NOT NULL);

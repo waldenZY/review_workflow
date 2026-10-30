@@ -1,10 +1,23 @@
 {
-  "api_url": "https://replace-me.example/v1/chat/completions",
-  "api_key": "replace-me",
-  "model": "replace-me",
-  "max_tokens": 4096,
-  "timeout": 120,
-  "stream": false,
-  "enable_thinking": false,
-  "skip_special_tokens": false
+  "schema_version": 2,
+  "active_profile_id": null,
+  "profiles": [
+    {
+      "id": "profile_example",
+      "name": "示例连接",
+      "config": {
+        "api_url": "https://replace-me.example/v1/chat/completions",
+        "api_key": "replace-me",
+        "model": "replace-me",
+        "max_tokens": 4096,
+        "timeout": 120,
+        "stream": false,
+        "enable_thinking": false,
+        "skip_special_tokens": false
+      },
+      "execution": {
+        "batch_concurrency": 1
+      }
+    }
+  ]
 }

@@ -486,7 +486,7 @@ th {
   white-space:nowrap
 }
 td,th {
-  padding:12px;
+  padding:6px 10px;
   border-bottom:1px solid #edf0f5;
   vertical-align:top
 }
@@ -497,7 +497,7 @@ tr:last-child td {
   display:block;
   min-width:100px;
   max-width:300px;
-  max-height:74px;
+  max-height:48px;
   overflow:hidden;
   line-height:1.6;
   overflow-wrap:anywhere
@@ -507,7 +507,7 @@ tr:last-child td {
   align-items:center;
   justify-content:space-between;
   gap:15px;
-  margin-top:12px;
+  margin:10px 0;
   font-size:12px;
   color:var(--muted)
 }
@@ -543,10 +543,71 @@ tr:last-child td {
 }
 .criterion-top {
   display:grid;
-  grid-template-columns:100px minmax(140px,1fr) auto auto;
+  grid-template-columns:36px minmax(140px,1fr) auto auto;
   align-items:center;
   gap:12px;
   margin-bottom:14px
+}
+.criterion-number {
+  color:var(--muted);
+  font-size:17px;
+  font-variant-numeric:tabular-nums
+}
+.evaluation-column {
+  background:#f2effc
+}
+.selected-paths {
+  display:block;
+  margin-top:4px;
+  max-width:280px;
+  white-space:normal;
+  overflow-wrap:anywhere;
+  font-weight:400;
+  color:#77629e
+}
+.sample-summary {
+  margin-top:4px;
+  max-width:500px;
+  overflow-wrap:anywhere
+}
+.advice-card {
+  border:1px solid #e1e5ef;
+  padding:12px;
+  margin:10px 0;
+  border-radius:7px
+}
+.execution-settings {
+  margin:16px 0;
+  padding:14px;
+  border:1px solid #e1e5ef;
+  border-radius:7px;
+  background:#f9fafc
+}
+.error-text {
+  color:#aa4259
+}
+.more-actions {
+  display:inline-block;
+  font-size:12px
+}
+.more-actions summary {
+  cursor:pointer;
+  padding:8px;
+  color:var(--muted)
+}
+.more-actions>div {
+  padding:10px;
+  background:#f9fafc;
+  border:1px solid #e1e5ef;
+  border-radius:7px
+}
+.more-actions p {
+  font-size:12px;
+  color:var(--muted);
+  margin:0 0 8px
+}
+.table-footer .field {
+  margin-bottom:0
 }
 .criterion-description {
   min-height:110px;
@@ -846,7 +907,7 @@ tr:last-child td {
     grid-template-columns:1fr
   }
   .criterion-top {
-    grid-template-columns:90px minmax(100px,1fr)
+    grid-template-columns:36px minmax(100px,1fr)
   }
   .criterion-top .check-label {
     grid-column:1

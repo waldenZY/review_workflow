@@ -5,7 +5,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -16,8 +16,25 @@ DEFAULTS = dict(api_url='', api_key='', model='', max_tokens=4096, timeout=120, 
                 enable_thinking=False, skip_special_tokens=False)
 
 
+def validate_execution(value):
+    if not isinstance(value, dict) or set(value) - {'batch_concurrency'}:
+        raise ValueError('执行设置仅支持 batch_concurrency。')
+    concurrency = value.get('batch_concurrency', 1)
+    if type(concurrency) is not int or not 1 <= concurrency <= 32:
+        raise ValueError('批跑并发数必须为 1–32 的整数。')
+    return {'batch_concurrency': concurrency}
+
+
 def strict_json(value):
-    return json.loads(value, parse_constant=lambda _: (_ for _ in ()).throw(ValueError('JSON 不支持非有限数值。')))
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError('JSON 对象存在重复键，不允许覆盖同名属性。')
+            result[key] = item
+        return result
+    return json.loads(value, object_pairs_hook=unique_object,
+                      parse_constant=lambda _: (_ for _ in ()).throw(ValueError('JSON 不支持非有限数值。')))
 
 
 def parse_output(raw):
@@ -26,11 +43,37 @@ def parse_output(raw):
     changes = []
     if text != raw:
         changes.append('trim_whitespace_or_bom')
+    # Fences inside a valid JSON string are data, not response wrappers.
+    try:
+        strict_json(text)
+        return text, changes
+    except (ValueError, TypeError):
+        pass
     match = re.fullmatch(r'```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```', text, re.IGNORECASE)
+    single = False
     if match:
+        try:
+            strict_json(match.group(1).strip())
+            single = True
+        except (ValueError, TypeError):
+            single = '```' not in match.group(1)
+    if match and single:
         text = match.group(1).strip()
         changes.append('removed_outer_code_fence')
+    elif '```' in text:
+        changes.append('rejected_non_outer_or_multiple_fences')
     return text, changes
+
+
+def decode_output(text, changes):
+    """Strict JSON with actionable diagnostics; normalization is retained by callers."""
+    if 'rejected_non_outer_or_multiple_fences' in changes:
+        raise ValueError('输出包含围栏外文字、多个围栏或不完整围栏；仅接受纯 JSON 或完整包裹响应的单个 JSON／无语言标记围栏。')
+    try:
+        return strict_json(text)
+    except (ValueError, TypeError) as exc:
+        prefix = '已剥离完整外围围栏，但内部 JSON 语法错误' if 'removed_outer_code_fence' in changes else '原始正文不是合法 JSON（未剥离围栏）'
+        raise ValueError(prefix + '：' + str(exc)) from None
 
 
 def fingerprint(value):
@@ -47,6 +90,10 @@ class Connection:
     stream: bool
     enable_thinking: bool
     skip_special_tokens: bool
+    profile_id: str = ''
+    profile_name: str = ''
+    # Workbench metadata captured with the connection, never part of HTTP parameters/fingerprint.
+    batch_concurrency: int = 1
 
     def __repr__(self):
         return 'Connection(credentials=<redacted>)'
@@ -55,6 +102,7 @@ class Connection:
         value = {key: getattr(self, key) for key in FIELDS - {'api_url', 'api_key'}}
         value['endpoint_sha256'] = hashlib.sha256(self.api_url.encode()).hexdigest()
         value['fingerprint'] = fingerprint(value)
+        value.update(profile_id=self.profile_id, profile_name=self.profile_name)
         return value
 
 
@@ -88,22 +136,77 @@ class ModelSettings:
     def __init__(self, path):
         self.path = Path(path)
         self.lock = threading.RLock()
-        self.values = dict(DEFAULTS)
-        self.current = None
-        self.error = '尚未配置模型，请打开模型设置。'
+        self.profiles = {}
+        self.active_id = None
+        self.error = ''
         self.secrets = set()
         try:
             raw = strict_json(self.path.read_text(encoding='utf-8-sig'))
+            # Register credentials before validation, including malformed local files.
+            def register(value):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if key == 'api_key' and isinstance(item, str) and item:
+                            self.secrets.add(item)
+                        else:
+                            register(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        register(item)
+            register(raw)
             if isinstance(raw, dict) and set(raw) == FIELDS:
-                self.values = raw
-                if isinstance(raw.get('api_key'), str) and raw['api_key']:
-                    self.secrets.add(raw['api_key'])
-            self.current = validate_connection(raw)
-            self.error = ''
+                # In-memory conversion only; startup never writes config or probes a provider.
+                raw = {'schema_version': 2, 'active_profile_id': 'profile_original',
+                       'profiles': [{'id': 'profile_original', 'name': '原有配置', 'config': raw}]}
+            if not isinstance(raw, dict) or set(raw) != {'schema_version', 'active_profile_id', 'profiles'} or raw['schema_version'] != 2 or not isinstance(raw['profiles'], list):
+                raise ValueError('配置文件结构错误，请参考命名配置示例。')
+            profiles = {}
+            names = set()
+            for item in raw['profiles']:
+                if not isinstance(item, dict) or not {'id', 'name', 'config'} <= set(item) or set(item) - {'id', 'name', 'config', 'execution'}:
+                    raise ValueError('命名配置必须包含 id、name、config，可选 execution。')
+                import re
+                if not isinstance(item['id'], str) or not re.fullmatch(r'profile_[A-Za-z0-9_-]+', item['id']) or item['id'] in profiles:
+                    raise ValueError('配置 ID 非法或重复。')
+                name = self._name(item['name'])
+                if name in names:
+                    raise ValueError('配置名称不可重复。')
+                config = copy.deepcopy(item['config'])
+                if not isinstance(config, dict) or set(config) != FIELDS or not isinstance(config.get('api_key'), str):
+                    raise ValueError('连接配置必须包含原有八个字段。')
+                validate_connection({**config, 'api_key': config['api_key'] or 'cleared-key'})
+                execution = validate_execution(item.get('execution', {}))
+                profiles[item['id']] = {'id': item['id'], 'name': name, 'config': config, 'execution': execution}
+                names.add(name)
+            active_id = raw['active_profile_id']
+            if active_id is not None and (not isinstance(active_id, str) or active_id not in profiles):
+                raise ValueError('当前配置 ID 不存在。')
+            self.profiles, self.active_id = profiles, active_id
         except FileNotFoundError:
             pass
         except (OSError, UnicodeError, ValueError) as exc:
-            self.error = str(exc) if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError) else '模型配置无法读取或不是合法 JSON，请在设置页重新填写。'
+            self.error = self.sanitize(str(exc)) if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError) else '模型配置无法读取或不是合法 JSON，请在设置页重新填写。'
+
+    @staticmethod
+    def _name(name):
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
+            raise ValueError('配置名称应为 1–120 个字符。')
+        return name.strip()
+
+    def _connection(self, profile_id):
+        profile = self.profiles.get(profile_id)
+        if profile is None:
+            raise ValueError('原模型配置已删除或不存在，请选择配置并新建复测。')
+        return replace(validate_connection(profile['config']), profile_id=profile_id, profile_name=profile['name'],
+                       batch_concurrency=profile['execution']['batch_concurrency'])
+
+    @property
+    def current(self):
+        with self.lock:
+            try:
+                return self._connection(self.active_id) if self.active_id else None
+            except ValueError:
+                return None
 
     def sanitize(self, value, extra_secrets=()):
         import html
@@ -128,22 +231,34 @@ class ModelSettings:
 
     def public(self):
         with self.lock:
-            public = {k: v for k, v in self.values.items() if k != 'api_key'}
-            return self.sanitize({'configured': self.current is not None, 'message': self.error or '配置已生效；修改影响所有项目的后续调用。',
-                                  'settings': public, 'api_key_configured': bool(self.values.get('api_key')),
-                                  'parameters': self.current.public() if self.current else None})
+            current = self.current
+            profiles = [{'id': p['id'], 'name': p['name'], 'settings': {k: v for k, v in p['config'].items() if k != 'api_key'},
+                         'execution': copy.deepcopy(p['execution']), 'api_key_configured': bool(p['config']['api_key']),
+                         'active': p['id'] == self.active_id} for p in self.profiles.values()]
+            active = self.profiles.get(self.active_id)
+            message = self.error or ('当前配置影响所有项目的后续调用；已提交任务保持原连接。' if current else '请选择并启用有效的命名配置；未配置仍可编辑、预览和执行程序规则。')
+            return self.sanitize({'configured': current is not None, 'message': message, 'active_profile_id': self.active_id,
+                'active_profile_name': active['name'] if active else None, 'profiles': profiles,
+                'settings': {k: v for k, v in (active['config'] if active else DEFAULTS).items() if k != 'api_key'},
+                'execution': copy.deepcopy(active['execution']) if active else {'batch_concurrency': 1},
+                'parameters': current.public() if current else None})
 
-    def capture(self):
+    def capture(self, profile_id=None):
         with self.lock:
-            if not self.current:
-                raise ValueError(self.error)
-            return self.current
+            selected = profile_id or self.active_id
+            if not selected:
+                raise ValueError(self.error or '尚未启用模型配置，请打开模型设置。')
+            return self._connection(selected)
 
-    def candidate(self, body):
+    def candidate(self, body, profile_id=None):
         with self.lock:
             value = copy.deepcopy(body)
-            value['api_key'] = value.get('api_key') or self.values.get('api_key', '')
-            return validate_connection(value)
+            saved = self.profiles.get(profile_id) if profile_id else None
+            if profile_id and saved is None:
+                raise ValueError('配置不存在。')
+            value['api_key'] = value.get('api_key') or (saved['config']['api_key'] if saved else '')
+            result = validate_connection(value)
+            return replace(result, profile_id=profile_id or '', profile_name=saved['name'] if saved else '未保存配置')
 
     def _write(self, value):
         from .store import uid
@@ -160,20 +275,48 @@ class ModelSettings:
             if temp.exists():
                 temp.unlink()
 
-    def save(self, body):
+    def _commit(self, profiles, active_id):
+        self._write({'schema_version': 2, 'active_profile_id': active_id, 'profiles': list(profiles.values())})
+        self.profiles, self.active_id, self.error = profiles, active_id, ''
+
+    def save(self, name, body, profile_id=None, execution=None):
+        from .store import uid
         with self.lock:
-            candidate = self.candidate(body)
+            name = self._name(name)
+            if any(p['name'] == name and p['id'] != profile_id for p in self.profiles.values()):
+                raise ValueError('配置名称不可重复。')
+            candidate = self.candidate(body, profile_id)
+            execution = validate_execution({} if execution is None else execution)
             value = {key: getattr(candidate, key) for key in FIELDS}
-            self._write(value)
-            self.values, self.current, self.error = value, candidate, ''
+            profile_id = profile_id or uid('profile')
+            profiles = copy.deepcopy(self.profiles)
+            profiles[profile_id] = {'id': profile_id, 'name': name, 'config': value, 'execution': execution}
             self.secrets.add(candidate.api_key)
+            self._commit(profiles, self.active_id)
+            return {'profile_id': profile_id, **self.public()}
+
+    def activate(self, profile_id):
+        with self.lock:
+            self._connection(profile_id)
+            self._commit(copy.deepcopy(self.profiles), profile_id)
             return self.public()
 
-    def clear_key(self):
+    def delete(self, profile_id):
         with self.lock:
-            value = {**self.values, 'api_key': ''}
-            self._write(value)
-            self.values, self.current, self.error = value, None, '密钥已清除，需要重新填写后才能调用模型。'
+            if profile_id not in self.profiles:
+                raise KeyError('配置不存在。')
+            profiles = copy.deepcopy(self.profiles)
+            del profiles[profile_id]
+            self._commit(profiles, None if self.active_id == profile_id else self.active_id)
+            return self.public()
+
+    def clear_key(self, profile_id):
+        with self.lock:
+            if profile_id not in self.profiles:
+                raise KeyError('配置不存在。')
+            profiles = copy.deepcopy(self.profiles)
+            profiles[profile_id]['config']['api_key'] = ''
+            self._commit(profiles, self.active_id)
             return self.public()
 
 

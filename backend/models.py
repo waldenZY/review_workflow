@@ -1,4 +1,5 @@
 from typing import Any, Literal, get_args
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -30,7 +31,7 @@ class MappingSave(Input):
 
 
 class Criterion(Input):
-    id: str = Field(min_length=1, max_length=80, pattern=r'^[A-Za-z0-9_-]+$')
+    id: str = Field(default_factory=lambda: 'criterion_' + uuid4().hex, min_length=1, max_length=80, pattern=r'^[A-Za-z0-9_-]+$')
     name: str = Field(min_length=1)
     description: str = ''
     enabled: bool = True
@@ -52,6 +53,9 @@ class SpecSave(Input):
         ids = [c.id for c in self.criteria]
         if len(ids) != len(set(ids)):
             raise ValueError('标准 ID 不可重复。')
+        names = [c.name for c in self.criteria]
+        if len(names) != len(set(names)):
+            raise ValueError('同一方案内的标准名称不可重复。')
         if not any(c.enabled for c in self.criteria):
             raise ValueError('至少启用一条标准。')
         return self
@@ -88,6 +92,14 @@ class ContextRequest(Input):
 
 class PreviewRequest(ContextRequest):
     row_id: str
+
+
+class DraftPreviewRequest(Input):
+    dataset_id: str
+    row_id: str
+    evaluation_fields: list[str] = Field(min_length=1)
+    spec: SpecSave
+    evaluator: EvaluatorSave
 
 
 class RunRequest(ContextRequest):
@@ -127,3 +139,16 @@ class ConnectionInput(Input):
     stream: bool
     enable_thinking: bool
     skip_special_tokens: bool
+
+
+class ExecutionSettings(Input):
+    batch_concurrency: int = Field(default=1, ge=1, le=32, strict=True)
+
+
+class ProfileSave(ConnectionInput):
+    name: str = Field(min_length=1, max_length=120)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+
+
+class ConnectionTest(ConnectionInput):
+    profile_id: str | None = None

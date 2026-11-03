@@ -1,4 +1,5 @@
 """Real HTTP only. Immutable connections are captured before each operation."""
+from contextlib import nullcontext
 import copy
 import hashlib
 import json
@@ -343,7 +344,7 @@ class Gateway:
             'model_config': connection.public() if connection else None, 'body': body,
             'notice': None if connection else '仅消息预览；模型尚未配置，不可发送。'})
 
-    def invoke(self, messages, connection, probe=False):
+    def invoke(self, messages, connection, probe=False, client=None):
         started = time.perf_counter()
         body = self.payload(messages, connection)
         if probe:
@@ -353,7 +354,7 @@ class Gateway:
         clean = lambda value: self.settings.sanitize(value, (connection.api_key,))
         trace['request']['body'] = clean(body)
         try:
-            with httpx.Client(timeout=connection.timeout, follow_redirects=False, trust_env=False) as client:
+            with (nullcontext(client) if client is not None else httpx.Client(timeout=connection.timeout, follow_redirects=False, trust_env=False)) as client:
                 with client.stream('POST', connection.api_url, headers={'Authorization': f'Bearer {connection.api_key}', 'Content-Type': 'application/json'}, json=body) as response:
                     trace['http_status'] = response.status_code
                     if not 200 <= response.status_code < 300:

@@ -5,6 +5,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell import WriteOnlyCell
 
 
 MISSING = object()
@@ -117,21 +118,32 @@ def flatten(value, prefix=''):
 
 
 def write_xlsx(path, rows, columns):
-    if len(columns) > 16384 or len(rows) > 1048575:
-        raise ValueError('超过 XLSX 行列容量，请缩小导出范围。')
-    workbook = Workbook()
-    ws = workbook.active
-    ws.title = '评测结果'
-    for row_index, row in enumerate([columns, *rows], 1):
-        for col_index, value in enumerate(row, 1):
-            if isinstance(value, (dict, list)):
-                value = json.dumps(value, ensure_ascii=False)
-            if isinstance(value, str) and len(value) > 32767:
-                raise ValueError(f'第 {row_index} 行第 {col_index} 列超过 Excel 单元格限制；完整结果仍保留在运行记录中。')
-            cell = ws.cell(row_index, col_index, value)
-            if isinstance(value, str):
-                cell.data_type = 's'
-    ws.freeze_panes = 'A2'
-    ws.auto_filter.ref = ws.dimensions
-    workbook.save(path)
-    workbook.close()
+    if len(columns)>16384:
+        raise ValueError('超过 XLSX 列容量。')
+    workbook=Workbook(write_only=True)
+    ws=workbook.create_sheet('评测结果')
+    ws.freeze_panes='A2'
+    try:
+        from itertools import chain
+        count=0
+        for row_index,row in enumerate(chain((columns,),rows),1):
+            if row_index>1048576:
+                raise ValueError('超过 XLSX 行容量，请使用 JSONL。')
+            cells=[]
+            for col_index,value in enumerate(row,1):
+                if isinstance(value,(dict,list)):
+                    value=json.dumps(value,ensure_ascii=False,allow_nan=False)
+                if isinstance(value,str) and len(value)>32767:
+                    raise ValueError(f'第 {row_index} 行第 {col_index} 列超过 Excel 单元格限制；请使用 JSONL。')
+                cell=WriteOnlyCell(ws,value=value)
+                if isinstance(value,str):
+                    cell.data_type='s'
+                cells.append(cell)
+            ws.append(cells)
+            count=row_index
+        from openpyxl.utils import get_column_letter
+        if columns:
+            ws.auto_filter.ref=f'A1:{get_column_letter(len(columns))}{count}'
+        workbook.save(path)
+    finally:
+        workbook.close()

@@ -12,17 +12,19 @@
   const helpSections = ['projects','data','standards','evaluator','execution','history','model'];
   const blankCriterion = () => ({name:'',description:'',enabled:true,method:'llm',target_field:'',rule_schema:{type:'object'},schemaText:'{"type":"object"}'});
   const s = {page:0,projects:[],project:null,projectForm:null,projectQuery:'',showArchivedProjects:false,epoch:0,busy:null,
-    notice:'',error:'',errorTrace:null,help:null,online:false,llm:{configured:false,message:'正在读取配置状态',profiles:[]},connectionForm:null,executionForm:{batch_concurrency:1},connectionDirty:false,connectionTest:null,profileId:null,profileName:''};
-  let pollTimer,previewTimer,previewSequence=0;
+    notice:'',error:'',errorTrace:null,help:null,online:false,projectsLoad:{status:'idle',error:''},modelLoad:{status:'idle',error:''},llm:{configured:false,message:'正在读取配置状态',profiles:[]},connectionForm:null,executionForm:{batch_concurrency:1},connectionDirty:false,connectionTest:null,profileId:null,profileName:''};
+  let pollTimer,previewTimer,previewSequence=0,projectsSequence=0,modelLoadSequence=0,connectionRevision=0;
+  let resultLoader=null,mountedRunKey=null,detailBytes=0,detailClock=0;
+  const detailCache=new Map();
   const scrollPositions=new Map();
   let scrollObservers=[],scrollResizers=[];
   class StaleResponse extends Error {}
   function resetWorkspace() {
-    clearTimeout(previewTimer);++previewSequence;
+    clearTimeout(previewTimer);++previewSequence;disposeResultLoader();clearDetailCache();
     Object.assign(s,{catalog:{datasets:[],mappings:[],specs:[],evaluators:[],runs:[]},dataset:null,rows:[],offset:0,pageSize:20,sampleId:'',selected:[],file:null,sheets:[],sheet:'',headerRow:1,
       mapping:{evaluation_fields:[]},mappingDirty:false,savedSpec:null,title:'新的评测方案',generationPrompt:'',designNotes:'',criteria:[blankCriterion()],
       designCallIds:[],specDirty:false,analysis:null,evaluator:null,evaluatorDirty:false,schemaText:'',projectionText:'',exampleText:'',example:null,preview:null,
-      previewPending:false,previewError:'',evaluatorError:'',evaluatorRevision:0,preparingEvaluator:false,cellViewer:null,specVersions:[],evaluatorVersions:[],compare:{},run:null,activeRunId:null,runRows:[],runOffset:0,runPageSize:20,runWanted:null,runTotal:0,runDetails:{},runLineage:null,runLoadSequence:0,rowLoadSequence:0,rowPageSequence:0,rerunRows:[],selectionMode:'selected',allConfirmed:false,
+      previewPending:false,previewError:'',evaluatorError:'',evaluatorRevision:0,preparingEvaluator:false,cellViewer:null,specVersions:[],evaluatorVersions:[],compare:{},run:null,activeRunId:null,runRows:[],runOffset:0,runPageSize:20,runWanted:null,runTotal:0,runLineage:null,runRounds:[],catalogLoaded:false,configRestored:false,runRestored:false,workspaceError:'',runStatusFilter:'all',runErrorStage:'',runPageError:'',runProgressError:'',runPageUpdated:null,runProgressUpdated:null,runPageLoading:false,pollFailures:0,cancelPending:false,runLoadSequence:0,rowLoadSequence:0,rerunRows:[],selectionMode:'selected',allConfirmed:false,
       customExport:false,exportColumns:[],includeRaw:false,historyKind:'dataset',includeArchived:false,historyItems:[],historyDetail:null});
   }
   resetWorkspace();
@@ -44,12 +46,13 @@
   function textarea(bind,v,rows=4,attrs='') {return `<textarea data-bind="${bind}" rows="${rows}" ${attrs}>${esc(v)}</textarea>`;}
   function select(bind,options,value,attrs='') {return `<select data-bind="${bind}" ${attrs}>${options.map(([v,t])=>`<option value="${esc(v)}" ${String(v)===String(value)?'selected':''}>${esc(t)}</option>`).join('')}</select>`;}
   function check(bind,value,label) {return `<label class="check-label"><input type="checkbox" data-bind="${bind}" ${value?'checked':''}>${esc(label)}</label>`;}
-  function button(action,text,style='',disabled=false,attrs='') {return `<button class="button ${style}" data-action="${action}" ${disabled||s.busy?'disabled':''} ${attrs}>${s.busy?.key===action?'<span class="spinner" aria-hidden="true"></span>':''}${text}</button>`;}
+  function button(action,text,style='',disabled=false,attrs='') {return `<button class="button ${style}" data-action="${action}" data-rule-disabled="${!!disabled}" ${disabled||s.busy?'disabled':''} ${attrs}>${s.busy?.key===action?'<span class="spinner" aria-hidden="true"></span>':''}${text}</button>`;}
   function detail(id,title,content) {return `<details class="advanced" id="${esc(id)}"><summary>${esc(title)}</summary>${content}</details>`;}
   function moreActions(id,content){return `<details class="more-actions" id="${esc(id)}"><summary>更多操作</summary><div><p>归档：隐藏且只读，可恢复。<br>删除：永久移除，无法恢复。</p>${content}</div></details>`;}
   function extraActions(id,content){return `<details class="more-actions" id="${esc(id)}"><summary>更多操作</summary><div class="extra-action-list">${content}</div></details>`;}
   function scrollTable(key,table){return `<div class="scroll-table" data-scroll-key="${esc(key)}"><div class="table-scroll-top" data-scroll-top tabindex="0" role="region" aria-label="上方横向滚动条" hidden><div></div></div><div class="table-scroll" data-scroll-body tabindex="0" role="region" aria-label="表格及下方横向滚动条">${table}</div></div>`;}
-  function cellButton(row,key,value,nested=false){return `<button type="button" class="cell-value" data-view-cell="${nested?'sample':'data'}" data-cell-row="${esc(row.row_id)}" data-cell-key="${esc(key)}" aria-label="查看源行 ${row.source_row} 的 ${esc(key)}"><span>${esc(value===undefined?'（缺失）':short(value))}</span></button>`;}
+  function previewValue(value){const text=value===undefined?'（缺失）':short(value);return text.length>180?text.slice(0,180)+'…':text;}
+  function cellButton(row,key,value,nested=false){return `<button type="button" class="cell-value" data-view-cell="${nested?'sample':'data'}" data-cell-row="${esc(row.row_id)}" data-cell-key="${esc(key)}" aria-label="查看源行 ${row.source_row} 的 ${esc(key)}"><span>${esc(previewValue(value))}</span></button>`;}
   function rememberScroll(){for(const node of root.querySelectorAll('[data-scroll-key]'))scrollPositions.set(node.dataset.scrollKey,node.querySelector('[data-scroll-body]').scrollLeft);}
   function connectScrollbars(){
     scrollObservers.forEach(o=>o.disconnect());scrollObservers=[];scrollResizers=[];
@@ -69,10 +72,15 @@
   function sampleSelect(label='分析样本'){return `<div class="sample-picker">${inlineField(label,select('sampleId',s.rows.map(r=>[r.row_id,`源行 ${r.source_row}`]),s.sampleId))}<span>仅预览或分析，不自动执行评测</span></div>`;}
   function next(page,text) {return `<div class="panel-footer"><span>${esc(text)}</span><button class="button primary" data-page="${page}">下一步 · ${pages[page][0]} →</button></div>`;}
   async function api(path,method='GET',body) {
-    const response = await fetch('/api/v1'+path,{method,headers:body===undefined||body instanceof FormData?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:body instanceof FormData?body:JSON.stringify(body)});
-    let value;try{value=await response.json();}catch{throw new Error(`服务返回了非 JSON 响应（HTTP ${response.status}），请检查服务端日志。`);}
-    if(!response.ok){const e=new Error(typeof value.detail==='string'?value.detail:pretty(value.detail||value));e.trace=value.trace||(value.references?{references:value.references}:null);throw e;}
-    return value;
+    const controller=method==='GET'?new AbortController():null;
+    const timer=controller?setTimeout(()=>controller.abort(),15000):null;
+    try {
+      const response=await fetch('/api/v1'+path,{method,signal:controller?.signal,headers:body===undefined||body instanceof FormData?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:body instanceof FormData?body:JSON.stringify(body)});
+      let value;try{value=await response.json();}catch(e){if(e.name==='AbortError')throw e;throw new Error(`服务返回了非 JSON 响应（HTTP ${response.status}）`);}
+      if(!response.ok){const e=new Error(typeof value.detail==='string'?value.detail:pretty(value.detail||value));e.trace=value.trace||(value.references?{references:value.references}:null);throw e;}
+      return value;
+    }catch(e){if(e.name==='AbortError')throw new Error(`读取超时（15秒）：${path}。后台任务不会因此取消。`);throw e;}
+    finally{if(timer)clearTimeout(timer);}
   }
   async function papi(path,method='GET',body) {
     if(!s.project)throw new Error('请先打开项目。');
@@ -82,12 +90,29 @@
   }
   async function action(key,label,task) {
     if(s.busy)return;
-    s.busy={key,label};s.error='';s.errorTrace=null;s.notice='';render();
+    s.busy={key,label};s.error='';s.errorTrace=null;s.notice='';renderActionState();
     try{await task();}catch(e){if(!(e instanceof StaleResponse)){s.error=e.message||String(e);s.errorTrace=e.trace;}}
-    finally{s.busy=null;render();if(s.page===3&&key!=='preview'&&key!=='file')schedulePreview();}
+    finally{s.busy=null;if(key==='load-run-config')render();else renderActionState();if(s.page===3&&key!=='preview'&&key!=='file')schedulePreview();}
   }
-  async function loadProjects(){s.projects=(await api('/projects?include_archived='+s.showArchivedProjects)).projects;}
-  async function refresh(){const c=await papi('/catalog');s.catalog=c;s.project=c.project;}
+  async function loadProjects(options={}){
+    const sequence=++projectsSequence,epoch=s.epoch;s.projectsLoad={status:'loading',error:''};patchProjectList();
+    try{
+      const value=await api('/projects?include_archived='+s.showArchivedProjects);if(sequence!==projectsSequence)return;
+      s.projects=value.projects;s.projectsLoad={status:'success',error:''};
+      if(options.restore&&s.epoch===epoch&&!s.project&&!s.projectForm&&s.page===0){const last=localStorage.getItem('eval.v1_1.project');s.project=s.projects.find(p=>p.id===last)||null;}
+      patchProjectList();patchProjectPicker();
+    }catch(e){if(sequence!==projectsSequence)return;s.projectsLoad={status:'error',error:e.message};patchProjectList();throw e;}
+  }
+  async function loadModelSettings(force=false){
+    const sequence=++modelLoadSequence,revision=connectionRevision;s.modelLoad={status:'loading',error:''};patchModelStatus();
+    try{
+      const value=await api('/llm/profiles');if(sequence!==modelLoadSequence)return;
+      const apply=revision===connectionRevision&&(force||(!s.connectionDirty&&!s.connectionForm));
+      if(apply)setConnection(value);
+      s.modelLoad={status:'success',error:'',retained:!apply};patchModelStatus(apply);
+    }catch(e){if(sequence!==modelLoadSequence)return;if(revision!==connectionRevision){s.modelLoad={status:'idle',error:'',retained:true};patchModelStatus();return;}s.modelLoad={status:'error',error:e.message};patchModelStatus();throw e;}
+  }
+  async function refresh(){const c=await papi('/catalog');s.catalog=c;s.project=c.project;s.catalogLoaded=true;}
   function setSpec(v){invalidatePreview();s.evaluatorError='';s.savedSpec=v;s.title=v.title;s.generationPrompt=v.generation_prompt;s.designNotes=v.design_notes;s.criteria=clone(v.criteria).map(c=>({...c,schemaText:pretty(c.rule_schema)}));s.designCallIds=[...v.design_call_ids];s.specDirty=false;s.analysis=null;s.specVersions=[];remember('spec',v);}
   function setEvaluator(v){invalidatePreview();++s.evaluatorRevision;s.evaluatorError='';s.evaluator=clone(v);s.schemaText=pretty(v.response_schema);s.projectionText=pretty(v.projection);s.exampleText=v.output_example==null?'':pretty(v.output_example);s.example=v.example_preview||null;s.evaluatorDirty=!v.id||!v.version;s.evaluatorVersions=[];if(v.id&&v.version)remember('evaluator',v);}
   async function openEvaluator(v,syncSpec=true){if(v.id)v=await papi(`/entities/${v.id}?version=${v.version}`);if(syncSpec&&(s.savedSpec?.id!==v.spec_id||s.savedSpec?.version!==v.spec_version))setSpec(await papi(`/entities/${v.spec_id}?version=${v.spec_version}`));setEvaluator(v);}
@@ -115,43 +140,155 @@
   }
   async function loadDataset(v,offset=0,pageSize=s.pageSize){
     invalidatePreview();const sequence=++s.rowLoadSequence;
+    if(!v.fields){v=await papi(`/entities/${v.id}?version=${v.version}`);if(sequence!==s.rowLoadSequence)return;}
     offset=Math.min(Math.max(0,offset),Math.max(0,Math.ceil(v.row_count/pageSize)-1)*pageSize);
-    const result=await papi(`/datasets/${v.id}/rows?offset=${offset}&limit=${pageSize}`);if(sequence!==s.rowLoadSequence)return;const changed=s.dataset?.id!==v.id;
+    const result=await papi(`/datasets/${v.id}/rows?offset=${offset}&limit=${pageSize}&version=${v.version}`);if(sequence!==s.rowLoadSequence)return;
+    const changed=s.dataset?.id!==v.id;let mapping=s.mapping;
+    if(changed){
+      const saved=remembered('mapping'),options=s.catalog.mappings.filter(m=>m.dataset_id===v.id);
+      const chosen=options.find(m=>m.id===saved?.id)||options[0];
+      mapping=chosen?(chosen.id===saved?.id?await papi(`/entities/${chosen.id}?version=${saved.version}`):clone(chosen)):{dataset_id:v.id,evaluation_fields:[]};
+      if(sequence!==s.rowLoadSequence)return;
+    }
     s.dataset=v;s.rows=result.rows;s.offset=offset;s.pageSize=pageSize;s.preview=null;
-    if(changed){s.mapping=clone(s.catalog.mappings.find(m=>m.dataset_id===v.id)||{dataset_id:v.id,evaluation_fields:[]});s.mappingDirty=false;s.selected=[];s.allConfirmed=false;s.sampleId='';remember('dataset',v);}
+    if(changed){s.mapping=mapping;s.mappingDirty=false;s.selected=[];s.allConfirmed=false;s.sampleId='';remember('dataset',v);}
     if(!s.rows.some(r=>r.row_id===s.sampleId))s.sampleId=s.rows[0]?.row_id||'';
   }
   async function switchProject(id){
-    if(dirty()&&!window.confirm('当前项目有未保存修改。继续切换会放弃这些草稿，是否继续？'))return;
+    if(dirty()&&!window.confirm('当前项目有未保存修改，切换会放弃这些草稿，是否继续？'))return;
     const epoch=++s.epoch;clearTimeout(pollTimer);resetWorkspace();s.project=null;
     if(!id){s.page=0;localStorage.removeItem('eval.v1_1.project');return;}
-    const catalog=await api(`/projects/${id}/catalog`);if(epoch!==s.epoch)return;
-    s.project=catalog.project;s.catalog=catalog;localStorage.setItem('eval.v1_1.project',id);
-    const pick=(list,kind)=>{const saved=remembered(kind);return list.find(v=>v.id===saved?.id)||list[0];};
-    const ds=pick(catalog.datasets,'dataset');if(ds)await loadDataset(ds);
-    const map=remembered('mapping');if(map&&catalog.mappings.some(v=>v.id===map.id&&v.dataset_id===ds?.id))s.mapping=await papi(`/entities/${map.id}?version=${map.version}`);
-    const sp=pick(catalog.specs,'spec');if(sp){const r=remembered('spec');setSpec(r?.id===sp.id?await papi(`/entities/${sp.id}?version=${r.version}`):sp);}
-    const ev=pick(catalog.evaluators.filter(v=>v.spec_id===s.savedSpec?.id&&v.spec_version===s.savedSpec?.version),'evaluator');if(ev){const r=remembered('evaluator');const value=r?.id===ev.id?await papi(`/entities/${ev.id}?version=${r.version}`):ev;if(value.spec_id===s.savedSpec?.id&&value.spec_version===s.savedSpec.version)await openEvaluator(value,false);}
-    const run=pick(catalog.runs,'run');if(run)await loadRun(run.id);
-    s.page=1;
+    const project=await api(`/projects/${id}`);if(epoch!==s.epoch)return;
+    s.project=project;localStorage.setItem('eval.v1_1.project',id);s.page=1;render();
+    await ensureWorkspace(1);
   }
-  async function loadRun(id,poll=false){
-    if(!poll&&s.activeRunId!==id){s.activeRunId=id;s.rerunRows=[];s.runOffset=0;s.runWanted=null;s.runDetails={};s.runLineage=null;}clearTimeout(pollTimer);
-    const sequence=++s.runLoadSequence;
-    const value=await papi(`/runs/${id}${poll?'/progress':''}`);if(s.activeRunId!==id||sequence!==s.runLoadSequence)return;
-    s.run=poll?{...s.run,...value}:value;remember('run',s.run);
-    await loadRunRows();if(s.activeRunId!==id||sequence!==s.runLoadSequence)return;
-    if(active(value.status)){const epoch=s.epoch;pollTimer=setTimeout(async()=>{try{if(epoch!==s.epoch||s.activeRunId!==id)return;await loadRun(id,true);if(!active(s.run.status))await refresh();if(s.page===4)render();}catch(e){if(!(e instanceof StaleResponse)){s.error=e.message;render();}}},900);}
+  async function ensureWorkspace(page){
+    if(!s.project||page===0||page===6)return;
+    try{
+      s.workspaceError='';
+      if(!s.catalogLoaded)await refresh();
+      if(page===5)return;
+      const pick=(list,kind)=>{const saved=remembered(kind);return list.find(v=>v.id===saved?.id)||list[0];};
+      if(!s.dataset){const ds=pick(s.catalog.datasets,'dataset');if(ds)await loadDataset(ds);}
+      if(page>=2&&!s.configRestored){
+        const sp=pick(s.catalog.specs,'spec');if(sp&&!s.savedSpec){const r=remembered('spec');setSpec(await papi(`/entities/${sp.id}?version=${r?.id===sp.id?r.version:sp.version}`));}
+        const ev=pick(s.catalog.evaluators.filter(v=>v.spec_id===s.savedSpec?.id&&v.spec_version===s.savedSpec?.version),'evaluator');
+        if(ev&&!s.evaluator){const r=remembered('evaluator');await openEvaluator({id:ev.id,version:r?.id===ev.id?r.version:ev.version},false);}
+        s.configRestored=true;
+      }
+      if(page===4&&!s.runRestored){const run=pick(s.catalog.runs,'run');if(run)await loadRun(run.id);s.runRestored=true;}
+    }catch(e){if(e instanceof StaleResponse)throw e;s.workspaceError='项目内容加载失败：'+e.message;throw e;}
   }
-  async function loadRunRows(offset=null,pageSize=null){
-    if(!s.run)return;const id=s.run.id,sequence=++s.rowPageSequence;
-    const target=offset===null?(s.runWanted||{offset:s.runOffset,size:s.runPageSize}):{offset,size:pageSize||s.runPageSize};
-    if(offset!==null)s.runWanted=target;
-    try{const value=await papi(`/runs/${id}/records?offset=${target.offset}&limit=${target.size}`);
-      if(s.activeRunId!==id||sequence!==s.rowPageSequence)return;
-      s.runOffset=target.offset;s.runPageSize=target.size;s.runRows=value.records;s.runTotal=value.total;s.runWanted=null;
-      for(const row of s.runRows){const cached=s.runDetails[row.row_id];if(cached&&(cached.attempts.length!==row.attempt_count||cached.status!==row.status))delete s.runDetails[row.row_id];}
-    }catch(e){if(s.activeRunId!==id||sequence!==s.rowPageSequence)return;s.runWanted=null;throw e;}
+  const stampText=v=>v?new Date(v).toLocaleString():'尚未成功读取';
+  function runIsCurrent(id,epoch,sequence){return s.epoch===epoch&&s.activeRunId===id&&s.runLoadSequence===sequence;}
+  function newResultLoader(){
+    return {epoch:s.epoch,pid:s.project.id,id:s.run.id,round:s.run.current_round,generation:0,view:0,
+      target:{offset:s.runOffset,size:s.runPageSize,filter:s.runStatusFilter,stage:s.runErrorStage},
+      success:null,active:null,pending:false,waiters:[],finalToken:null,finalNeeded:false,finalFailed:false};
+  }
+  function currentLoader(c){return c===resultLoader&&s.epoch===c.epoch&&s.project?.id===c.pid&&s.run?.id===c.id&&s.activeRunId===c.id;}
+  function settleRowWaiters(c,error=null){
+    const list=c.waiters.splice(0);for(const waiter of list){if(error)waiter.reject(error);else waiter.resolve();}
+  }
+  function disposeResultLoader(){
+    if(resultLoader){resultLoader.pending=false;settleRowWaiters(resultLoader,new StaleResponse());}
+    resultLoader=null;
+  }
+  function acceptRun(value){
+    const changed=s.run?.id!==value.id;s.run=value;
+    if(changed||!resultLoader){
+      disposeResultLoader();clearDetailCache();
+      s.rerunRows=[];s.runOffset=0;s.runPageSize=20;s.runWanted=null;s.runRows=[];s.runTotal=0;s.runLineage=null;s.runRounds=[];s.runStatusFilter='all';s.runErrorStage='';s.runPageError='';s.runPageUpdated=null;
+      resultLoader=newResultLoader();
+    }
+    const c=resultLoader;
+    if(c.round!==value.current_round){
+      ++c.generation;c.round=value.current_round;c.finalToken=null;c.finalNeeded=false;c.finalFailed=false;c.pending=true;
+      settleRowWaiters(c,new StaleResponse());
+    }
+    if(!active(value.status)){
+      const token=JSON.stringify([value.current_round,value.status,value.finished_at]);
+      if(token!==c.finalToken){c.finalToken=token;c.finalNeeded=true;c.finalFailed=false;c.pending=true;}
+    }else{c.pending=true;}
+  }
+  function rowContextCurrent(c,ctx){return currentLoader(c)&&ctx.generation===c.generation&&ctx.round===c.round&&ctx.view===c.view;}
+  function viewKey(target){return JSON.stringify([target.offset,target.size,target.filter,target.stage]);}
+  function resumeRunRows(){
+    const c=resultLoader;
+    if(c&&currentLoader(c)&&s.page===4&&!c.finalFailed){if(!s.runPageUpdated||c.finalNeeded)c.pending=true;pumpRunRows(c);}
+  }
+  async function pumpRunRows(c){
+    if(!currentLoader(c)||s.page!==4||c.active||!c.pending)return;
+    c.pending=false;
+    const ctx={generation:c.generation,round:c.round,view:c.view,target:{...c.target},finalToken:c.finalToken};
+    c.active=ctx;s.runPageLoading=true;patchRunPageNotice();
+    try{
+      const t=ctx.target;
+      const value=await papi(`/runs/${c.id}/records?offset=${t.offset}&limit=${t.size}&status_group=${t.filter}&error_stage=${encodeURIComponent(t.stage)}`);
+      if(!rowContextCurrent(c,ctx))return;
+      s.runOffset=value.offset;s.runPageSize=value.limit;s.runStatusFilter=t.filter;s.runErrorStage=t.stage;
+      s.runRows=value.records;s.runTotal=value.total;s.runPageError='';s.runPageUpdated=new Date().toISOString();s.runWanted=null;
+      c.success={...t,offset:value.offset,size:value.limit};c.successRound=ctx.round;c.target={...c.success};
+      if(ctx.finalToken&&ctx.finalToken===c.finalToken){c.finalNeeded=false;c.finalFailed=false;if(!active(s.run.status))c.pending=false;}
+      for(const row of s.runRows){const entry=detailCache.get(row.row_id);if(entry&&entry.signature!==recordSignature(row))entry.stale=true;}
+      settleRowWaiters(c);patchRunRows();patchRunStatus();
+    }catch(e){
+      if(!rowContextCurrent(c,ctx)||e instanceof StaleResponse)return;
+      s.runWanted=null;s.runPageError='结果页更新失败，保留上次成功页面：'+e.message;
+      if(c.waiters.length&&c.success){c.target={...c.success};s.runStatusFilter=c.target.filter;s.runErrorStage=c.target.stage;}
+      // A read started before terminal confirmation cannot consume the required final read.
+      if(ctx.finalToken===c.finalToken){c.pending=false;if(c.finalNeeded)c.finalFailed=true;}
+      settleRowWaiters(c,e);patchRunFilters();patchRunPageNotice();
+    }finally{
+      if(c.active===ctx)c.active=null;
+      if(currentLoader(c)){
+        s.runPageLoading=false;patchRunPageNotice();
+        if(c.pending&&!c.finalFailed&&s.page===4)queueMicrotask(()=>pumpRunRows(c));
+      }
+    }
+  }
+  function loadRunRows(offset=null,pageSize=null,background=false){
+    if(!s.run)return Promise.resolve();
+    const c=resultLoader;if(!c||!currentLoader(c))return Promise.resolve();
+    const target={...c.target,filter:s.runStatusFilter,stage:s.runErrorStage};
+    if(offset!==null){target.offset=offset;target.size=pageSize||s.runPageSize;}
+    if(viewKey(target)!==viewKey(c.target)){++c.view;settleRowWaiters(c,new StaleResponse());c.target=target;}
+    c.pending=true;
+    if(!background){c.finalFailed=false;s.runWanted={offset:target.offset,size:target.size};}
+    if(background||s.page!==4){pumpRunRows(c);return Promise.resolve();}
+    const promise=new Promise((resolve,reject)=>c.waiters.push({resolve,reject}));pumpRunRows(c);return promise;
+  }
+  function schedulePoll(id,epoch,sequence,delay=2000){
+    clearTimeout(pollTimer);
+    if(!runIsCurrent(id,epoch,sequence)||!active(s.run?.status))return;
+    pollTimer=setTimeout(()=>pollRun(id,epoch,sequence),delay);
+  }
+  async function pollRun(id,epoch,sequence){
+    if(!runIsCurrent(id,epoch,sequence))return;
+    try{
+      const value=await papi(`/runs/${id}/progress`);if(!runIsCurrent(id,epoch,sequence))return;
+      acceptRun({...s.run,...value});s.runProgressError='';s.runProgressUpdated=new Date().toISOString();s.pollFailures=0;
+      patchRunStatus();resumeRunRows();
+      if(!active(value.status))refresh().then(patchRunPicker).catch(e=>{if(!(e instanceof StaleResponse)){s.workspaceError='目录刷新失败：'+e.message;patchFeedback();}});
+    }catch(e){
+      if(!runIsCurrent(id,epoch,sequence)||e instanceof StaleResponse)return;
+      s.pollFailures++;s.runProgressError='进度更新失败：'+e.message;patchRunStatus();
+    }finally{
+      if(runIsCurrent(id,epoch,sequence))schedulePoll(id,epoch,sequence,s.pollFailures?[2000,4000,8000,15000][Math.min(s.pollFailures-1,3)]:2000);
+    }
+  }
+  async function loadRun(id){
+    if(!id)return;
+    const previousId=s.run?.id,epoch=s.epoch,sequence=++s.runLoadSequence;
+    clearTimeout(pollTimer);s.activeRunId=id;
+    try{
+      const value=await papi(`/runs/${id}`);if(!runIsCurrent(id,epoch,sequence))return;
+      acceptRun(value);s.runRestored=true;s.runProgressUpdated=new Date().toISOString();s.runProgressError='';s.pollFailures=0;remember('run',value);
+      schedulePoll(id,epoch,sequence);resumeRunRows();
+    }catch(e){
+      if(runIsCurrent(id,epoch,sequence)&&previousId){s.activeRunId=previousId;if(resultLoader)resultLoader.pending=true;s.runProgressError='运行读取失败，保留上次运行：'+e.message;schedulePoll(previousId,epoch,sequence);resumeRunRows();}
+      throw e;
+    }
   }
   function invalidatePreview(){clearTimeout(previewTimer);++previewSequence;s.preview=null;s.previewError='';s.previewPending=false;}
   function criteriaPayload(){return s.criteria.map(({schemaText,...c})=>({...c,rule_schema:c.method==='json_schema'?JSON.parse(schemaText):c.rule_schema}));}
@@ -177,12 +314,42 @@
     if(/\.xlsx$/i.test(file.name)){const form=new FormData();form.append('file',file);s.sheets=(await papi('/datasets/inspect','POST',form)).sheets;s.sheet=s.sheets[0];}
   }
   function contextBody(){if(!ready())throw new Error('请先保存字段配置、标准和绑定该标准版本的评测器。');return {mapping_id:s.mapping.id,mapping_version:s.mapping.version,evaluator_id:s.evaluator.id,evaluator_version:s.evaluator.version};}
-  async function startRun(single){const body=contextBody();if(!single&&s.selectionMode==='all'&&!s.allConfirmed)throw new Error('请明确确认全量运行。');const all=!single&&s.selectionMode==='all';const ids=all?[]:single?s.selected.slice(0,1):s.selected;if(!all&&!ids.length)throw new Error('请在本页勾选样本。');const run=await papi('/runs','POST',{...body,selection_mode:all?'all':'selected',row_ids:ids});await loadRun(run.id);await refresh();s.notice='任务已提交。结果将在本页更新，模型调用不会自动重试。';}
+  async function startRun(single){const body=contextBody();if(!single&&s.selectionMode==='all'&&!s.allConfirmed)throw new Error('请明确确认全量运行。');const all=!single&&s.selectionMode==='all';const ids=all?[]:single?s.selected.slice(0,1):s.selected;if(!all&&!ids.length)throw new Error('请在本页勾选样本。');const run=await papi('/runs','POST',{...body,selection_mode:all?'all':'selected',row_ids:ids});await openSubmittedRun(run);}
+  async function openSubmittedRun(value){
+    s.notice=`任务已提交：${value.id}。后续读取失败不会撤销该运行，请从运行列表恢复查看，勿重复提交。`;
+    try{await loadRun(value.id);}
+    finally{try{await refresh();patchRunPicker();}catch(e){if(!(e instanceof StaleResponse)){s.workspaceError='运行已提交，目录读取失败：'+e.message;patchFeedback();}}}
+  }
   async function loadHistory(){s.historyItems=(await papi(`/history?kind=${s.historyKind}&include_archived=${s.includeArchived}`)).items;if(s.historyDetail){const v=s.historyDetail.object;s.historyDetail=await papi(`/history/${v.kind||'run'}/${v.id}`);}}
+  function projectListHTML(){
+    const status=s.projectsLoad,list=s.projects.filter(p=>(p.name+' '+p.description).toLowerCase().includes(s.projectQuery.toLowerCase()));
+    const notice=status.status==='loading'?'<p class="loading-inline">正在加载项目列表…</p>':status.status==='error'?`<div class="message warning">项目列表读取失败：${esc(status.error)}${button('filter-projects','重试项目列表')}</div>`:'';
+    const cards=list.map(p=>`<article class="project-card ${p.archived_at?'archived':''}"><h2>${esc(p.name)} ${p.archived_at?badge('已归档'):''}</h2><p>${esc(p.description||'暂无说明')}</p><div class="project-counts">${[['dataset','数据集'],['spec','标准方案'],['evaluator','评测器'],['run','运行']].map(([k,t])=>`<span>${t} ${p.counts[k]}</span>`).join('')}</div><small>更新于 ${esc(new Date(p.updated_at).toLocaleString())}</small><code class="project-id">${esc(p.id)}</code><div class="button-group">${button('open-project','打开','primary',false,`data-id="${p.id}"`)}${!p.archived_at?button('edit-project','编辑','',false,`data-id="${p.id}"`):''}${moreActions('project-more-'+p.id,button('project-lifecycle',p.archived_at?'恢复项目':'归档项目','',false,`data-id="${p.id}" data-restore="${!!p.archived_at}"`)+button('delete-project','永久删除','danger',false,`data-id="${p.id}"`))}</div></article>`).join('');
+    return notice+(list.length?`<div class="project-grid">${cards}</div>`:status.status==='success'?empty(s.projectQuery?'没有匹配项目。':'还没有项目。先创建项目，再导入自己的已有数据。'):status.status==='idle'?'<p class="muted">项目列表尚未加载。</p>':'');
+  }
+  function patchProjectList(){replaceSmallHTML(document.getElementById('project-list-region'),projectListHTML());}
+  function patchProjectPicker(){
+    for(const button of root.querySelectorAll('button[data-page]')){const page=Number(button.dataset.page);button.disabled=page>0&&page<6&&!s.project;}
+    const node=root.querySelector('[data-bind="projectChoice"]');if(!node||document.activeElement===node)return;
+    const options=[...s.projects];if(s.project&&!options.some(p=>p.id===s.project.id))options.unshift(s.project);
+    const holder=document.createElement('div');holder.innerHTML=select('projectChoice',[['','选择项目'],...options.map(p=>[p.id,p.name+(p.archived_at?'（已归档）':'')])],s.project?.id||'');
+    if(node.innerHTML!==holder.firstElementChild.innerHTML)node.innerHTML=holder.firstElementChild.innerHTML;node.value=s.project?.id||'';
+  }
   function projectPage(){
     let form='';if(s.projectForm){const p=s.projectForm;form=panel(p.id?'修改项目':'新建项目','每个项目独立保存数据、配置和运行。模型连接全局共用。',field('项目名称',input('projectForm.name',p.name))+field('项目说明（可选）',textarea('projectForm.description',p.description,3))+`<div class="toolbar">${button('save-project','保存项目','primary')}${button('cancel-project-form','取消')}</div>`);}
-    const list=s.projects.filter(p=>(p.name+' '+p.description).toLowerCase().includes(s.projectQuery.toLowerCase()));
-    return `<div class="toolbar project-toolbar">${inlineField('查找项目',input('projectQuery',s.projectQuery,'search','placeholder="按名称或说明查找"'))}${check('showArchivedProjects',s.showArchivedProjects,'包含已归档项目')}${button('filter-projects','筛选 / 刷新')}${button('new-project','＋ 新建项目','primary')}</div>${form}${list.length?`<div class="project-grid">${list.map(p=>`<article class="project-card ${p.archived_at?'archived':''}"><h2>${esc(p.name)} ${p.archived_at?badge('已归档'):''}</h2><p>${esc(p.description||'暂无说明')}</p><div class="project-counts">${[['dataset','数据集'],['spec','标准方案'],['evaluator','评测器'],['run','运行']].map(([k,t])=>`<span>${t} ${p.counts[k]}</span>`).join('')}</div><small>更新于 ${esc(new Date(p.updated_at).toLocaleString())}</small><code class="project-id">${esc(p.id)}</code><div class="button-group">${button('open-project','打开','primary',false,`data-id="${p.id}"`)}${!p.archived_at?button('edit-project','编辑','',false,`data-id="${p.id}"`):''}${moreActions('project-more-'+p.id,button('project-lifecycle',p.archived_at?'恢复项目':'归档项目','',false,`data-id="${p.id}" data-restore="${!!p.archived_at}"`)+button('delete-project','永久删除','danger',false,`data-id="${p.id}"`))}</div></article>`).join('')}</div>`:empty('还没有项目。先创建项目，再导入自己的已有数据。')}`;
+    return `<div class="toolbar project-toolbar">${inlineField('查找项目',input('projectQuery',s.projectQuery,'search','placeholder="按名称或说明查找"'))}${check('showArchivedProjects',s.showArchivedProjects,'包含已归档项目')}${button('filter-projects','筛选 / 刷新')}${button('new-project','＋ 新建项目','primary')}</div>${form}<div id="project-list-region">${projectListHTML()}</div>`;
+  }
+  function modelLoadHTML(){
+    const load=s.modelLoad;
+    return load.status==='loading'?'<p class="loading-inline">正在读取模型配置；项目列表可独立使用。</p>':load.status==='error'?`<div class="message warning">模型配置读取失败：${esc(load.error)}${button('reload-connection','重试模型配置')}</div>`:load.retained?'<p class="inline-note">已保留后续编辑或选择，旧读取响应未应用。</p>':'';
+  }
+  function modelPageMarkup(){return `<div id="model-load-status">${modelLoadHTML()}</div><div id="model-form-content">${settingsPage()}</div>`;}
+  function patchModelStatus(replaceForm=false){
+    const header=document.getElementById('global-model-state');
+    if(header)header.textContent=`${s.online?'服务已连接':'等待连接'} · 当前模型配置：${s.llm.active_profile_name||'未选择'}${s.modelLoad.status==='loading'?'（加载中）':s.modelLoad.status==='error'?'（读取失败，可重试）':''}`;
+    replaceSmallHTML(document.getElementById('model-load-status'),modelLoadHTML());
+    if(replaceForm)replaceSmallHTML(document.getElementById('model-form-content'),settingsPage());
+    replaceSmallHTML(document.getElementById('execution-context'),s.project?executionContextHTML():'');syncControls();
   }
   function dataPage(){
     let result=panel('导入已有数据','JSONL / JSON / XLSX，最大 25 MB；不生成待评测内容。',`<div class="toolbar"><label class="button">选择文件<input type="file" data-file="dataset" accept=".jsonl,.json,.xlsx" hidden ${readonly()?'disabled':''}></label><span class="muted">${esc(s.file?.name||'尚未选择文件')}</span></div>${s.file?`<div class="toolbar">${s.sheets?.length?inlineField('工作表',select('sheet',s.sheets.map(v=>[v,v]),s.sheet))+inlineField('表头行',input('headerRow',s.headerRow,'number','min="1"')):''}${button('import','导入到当前项目','primary',readonly())}</div>`:''}`);
@@ -224,19 +391,152 @@
     result+=panel('实际消息预览',`自动刷新，不调用模型。${source?`当前样本：源行 ${source.source_row}。`:''}`,(s.rows.length?sampleSelect('预览样本'):'')+`<div id="preview-content">${previewMarkup()}</div>`);
     return result+next(4,'保存评测器后即可选择样本执行。');
   }
+  function executionContextHTML(){return `${[['项目',s.project.name],['数据集',s.dataset?.filename||'尚未选择'],['字段配置',s.mapping.id?`v${s.mapping.version}`:'尚未保存'],['标准 / 评测器',s.evaluator?.id?`标准 v${s.evaluator.spec_version} / 评测器 v${s.evaluator.version}`:'尚未保存'],['模型',needsModel()?s.llm.settings?.model||'未配置':'纯程序规则，不调用模型'],['本次提交并发数',needsModel()?String(s.llm.execution?.batch_concurrency||1):'1（纯程序规则）'],['服务地址',needsModel()?s.llm.settings?.api_url||'未配置':'无需模型连接']].map(([k,v])=>`<div><span>${k}</span><strong>${esc(v)}</strong></div>`).join('')}`;}
   function executionPage(){
-    let result=panel('创建评测任务','只在你点击试评或运行后执行；所有 LLM 标准共同使用评测字段。',`<div class="context-grid">${[['项目',s.project.name],['数据集',s.dataset?.filename||'尚未选择'],['字段配置',s.mapping.id?`v${s.mapping.version}`:'尚未保存'],['标准 / 评测器',s.evaluator?.id?`标准 v${s.evaluator.spec_version} / 评测器 v${s.evaluator.version}`:'尚未保存'],['模型',needsModel()?s.llm.settings?.model||'未配置':'纯程序规则，不调用模型'],['本次提交并发数',needsModel()?String(s.llm.execution?.batch_concurrency||1):'1（纯程序规则）'],['服务地址',needsModel()?s.llm.settings?.api_url||'未配置':'无需模型连接']].map(([k,v])=>`<div><span>${k}</span><strong>${esc(v)}</strong></div>`).join('')}</div>${!ready()?'<p class="inline-note">请先保存字段配置、标准及绑定该标准版本的评测器。加载运行配置后可恢复当时的选择。</p>':''}${needsModel()&&!s.llm.configured?'<p class="inline-note">需要先在全局“模型设置”配置连接。</p>':''}`);
+    let result=panel('创建评测任务','只在你点击试评或运行后执行；所有 LLM 标准共同使用评测字段。',`<div class="context-grid" id="execution-context">${executionContextHTML()}</div>${!ready()?'<p class="inline-note">请先保存字段配置、标准及绑定该标准版本的评测器。加载运行配置后可恢复当时的选择。</p>':''}${needsModel()&&!s.llm.configured?'<p class="inline-note">需要先在全局“模型设置”配置连接。</p>':''}`);
     if(s.dataset){const paths=s.mapping.evaluation_fields;
       const table=`<table class="compact-table sample-table" style="width:${104+paths.length*220}px;min-width:100%"><colgroup><col style="width:40px"><col style="width:64px">${paths.map(()=>'<col style="width:220px">').join('')}</colgroup><thead><tr><th>选择</th><th>源行</th>${paths.map(p=>`<th title="${esc(p)}">${esc(p)}</th>`).join('')}</tr></thead><tbody>${s.rows.map(r=>`<tr><td><input type="checkbox" data-row="${esc(r.row_id)}" ${s.selected.includes(r.row_id)?'checked':''} ${readonly()?'disabled':''} aria-label="选择原始行 ${r.source_row}"></td><td>${r.source_row}</td>${paths.map(p=>`<td>${cellButton(r,p,getAt(r.original,p),true)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
-      result+=panel('选择样本','只展示参与评测的字段。点击内容查看完整值，勾选可跨页保留。',scrollTable('sample:'+s.dataset.id,table)+pagination()+`<div class="toolbar execution-range">${inlineField('运行范围',select('selectionMode',[['selected',`勾选的 ${s.selected.length} 条`],['all',`全部 ${s.dataset.row_count} 条`]],s.selectionMode))}${s.selectionMode==='all'?check('allConfirmed',s.allConfirmed,`我确认执行全部 ${s.dataset.row_count} 条记录`):''}</div><div class="panel-footer"><span>已勾选 ${s.selected.length} 条${s.selected[0]?`；试评首条 ID：${esc(s.selected[0])}`:''}</span><div class="button-group">${button('trial','试评选中的第 1 条','',!canExecute()||!s.selected.length)}${button('run','运行所选范围','primary',!canExecute()||(s.selectionMode==='all'?!s.allConfirmed:!s.selected.length))}</div></div>`,'','run');}
+      result+=panel('选择样本','只展示参与评测的字段。点击内容查看完整值，勾选可跨页保留。',scrollTable('sample:'+s.dataset.id,table)+pagination()+`<div class="toolbar execution-range">${inlineField('运行范围',select('selectionMode',[['selected',`勾选的 ${s.selected.length} 条`],['all',`全部 ${s.dataset.row_count} 条`]],s.selectionMode))}${s.selectionMode==='all'?check('allConfirmed',s.allConfirmed,`我确认执行全部 ${s.dataset.row_count} 条记录`):''}</div><div class="panel-footer"><span data-sample-selection>已勾选 ${s.selected.length} 条${s.selected[0]?`；试评首条 ID：${esc(s.selected[0])}`:''}</span><div class="button-group">${button('trial','试评选中的第 1 条','',!canExecute()||!s.selected.length)}${button('run','运行所选范围','primary',!canExecute()||(s.selectionMode==='all'?!s.allConfirmed:!s.selected.length))}</div></div>`,'','run');}
     result+=panel('运行与基本预览','在这里查验结果后导出分析；执行失败与内容不通过分别显示。',s.run?runView():empty('尚未执行任务，可从右侧选择已有运行。'),select('runChoice',[['','选择项目内运行'],...s.catalog.runs.map(v=>[v.id,`${v.title} · ${labels[v.status]||v.status}`])],s.run?.id||'')+button('refresh-run','刷新'),'trial');
     if(s.run){const r=s.run;const cols=r.original_columns;const locked=new Set(r.snapshot.mapping.evaluation_fields.map(p=>p.slice(1).split('/')[0].replace(/~1/g,'/').replace(/~0/g,'~')));
       result+=panel('导出结果','导出保留原始行序和全部记录；未执行与失败行也会保留。',check('customExport',s.customExport,'自定义保留的原始列（默认保留全部）')+(s.customExport?`<p class="inline-note">评测字段对应的顶层列固定保留，包括该列中的其他嵌套内容。</p><div class="check-grid">${cols.map(k=>`<label class="check-label"><input type="checkbox" data-export-column="${esc(k)}" ${locked.has(k)||s.exportColumns.includes(k)?'checked':''} ${locked.has(k)?'disabled':''}>${esc(k)}${locked.has(k)?'（评测列）':''}</label>`).join('')}</div>`:'')+`<div class="toolbar">${check('includeRaw',s.includeRaw,'包含原始模型响应（默认不含）')}</div>`,button('export-xlsx','导出 XLSX','primary',active(r.status))+button('export-jsonl','导出 JSONL','',active(r.status)));}
     return result;
   }
+  function resultCell(row,path){
+    const value=row.missing_fields.includes(path)?undefined:row.fields[path];
+    return `<button type="button" class="cell-value" data-view-cell="result" data-cell-row="${esc(row.row_id)}" data-cell-key="${esc(path)}" aria-label="查看源行 ${row.source_row} 的 ${esc(path)}"><span>${esc(previewValue(value))}</span></button>`;
+  }
+  function recordSignature(row){return JSON.stringify([row.status,row.round_no,row.latest_attempt_id,row.attempt_count,row.result_round,row.previous_attempt]);}
+  function clearDetailCache(){for(const entry of detailCache.values())entry.node?.remove();detailCache.clear();detailBytes=0;}
+  function detailIsOpen(rowId){return !!document.getElementById('result-'+rowId)?.open;}
+  function estimateDetailBytes(value){
+    let size=0;const stack=[value];
+    while(stack.length){const v=stack.pop();if(typeof v==='string')size+=v.length*2;else if(v&&typeof v==='object'){size+=32;for(const [k,child] of Object.entries(v)){size+=k.length*2;stack.push(child);}}else size+=8;}
+    return size;
+  }
+  function pruneDetailCache(){
+    const closed=[...detailCache.values()].filter(e=>!detailIsOpen(e.rowId)).sort((a,b)=>a.used-b.used);
+    while((detailCache.size>10||detailBytes>10*1024*1024)&&closed.length){
+      const entry=closed.shift();entry.node?.remove();detailCache.delete(entry.rowId);detailBytes-=entry.bytes;
+      const outer=document.getElementById('result-'+entry.rowId);const slot=outer?.querySelector('[data-detail-slot]');
+      if(slot)slot.textContent='详情缓存已释放，需要时重新加载。';const note=outer?.querySelector('[data-detail-notice]');if(note)note.textContent='';
+    }
+  }
+  function detailNode(entry){
+    if(entry.node)return entry.node;
+    const node=document.createElement('div');node.dataset.detailEntry=entry.rowId;
+    node.innerHTML=`<p>加载时状态：${badge(entry.value.status)} · 轮次 ${entry.value.round_no??'未记录'}</p>${entry.value.attempts.length?entry.value.attempts.map((attempt,i)=>`<article class="attempt-card" data-attempt-id="${esc(attempt.id)}"><div class="toolbar"><strong>第 ${i+1} 次尝试</strong>${badge(attempt.status)}<span>轮次 ${attempt.round_no??'未记录'}</span></div><p>错误阶段：${esc(labels[attempt.error_stage]||attempt.error_stage||'无')}</p>${attempt.error?`<p class="error-text">${esc(attempt.error)}</p>`:''}<p class="muted">开始 ${esc(attempt.started_at||'未记录')} · 结束 ${esc(attempt.finished_at||'未记录')}</p>${[['timing','阶段耗时（毫秒；null表示未记录）'],['request','请求'],['response','响应与解析']].map(([kind,title])=>`<details class="advanced" id="attempt-${esc(attempt.id)}-${kind}" data-attempt-section="${kind}" data-attempt-index="${i}"><summary>${title}</summary><div data-lazy-detail-body></div></details>`).join('')}</article>`).join(''):empty('尚未形成已保存的尝试。')}`;
+    for(const article of [...node.querySelectorAll('[data-attempt-id]')]){
+      const saved=entry.reuse?.get(article.dataset.attemptId);if(!saved)continue;
+      const index=entry.value.attempts.findIndex(a=>a.id===article.dataset.attemptId);
+      const current=entry.value.attempts[index];
+      for(const section of saved.node.querySelectorAll('[data-attempt-index]'))section.dataset.attemptIndex=String(index);
+      if(pretty(saved.timing)!==pretty(current.timing)){
+        const body=saved.node.querySelector('[data-attempt-section="timing"] [data-lazy-detail-body]');
+        body.replaceChildren();delete body.dataset.rendered;delete body.dataset.bytes;
+      }
+      article.replaceWith(saved.node);
+      for(const body of saved.node.querySelectorAll('[data-lazy-detail-body][data-rendered]')){const size=Number(body.dataset.bytes||0);entry.bytes+=size;detailBytes+=size;}
+    }
+    delete entry.reuse;entry.node=node;return node;
+  }
+  function fillDetailSection(target){
+    if(!target.open||!target.dataset.attemptSection)return;
+    const owner=target.closest('[data-detail-entry]'),entry=owner&&detailCache.get(owner.dataset.detailEntry);
+    if(!entry||entry.node!==owner)return;
+    entry.used=++detailClock;const slot=target.querySelector('[data-lazy-detail-body]');if(slot.dataset.rendered)return;
+    const attempt=entry.value.attempts[Number(target.dataset.attemptIndex)],kind=target.dataset.attemptSection;
+    const payload=kind==='timing'?(attempt.timing||'历史未记录'):kind==='request'?attempt.request:
+      {raw_response:attempt.raw_response,raw_output:attempt.raw_output,normalized_output:attempt.normalized_output,normalization:attempt.normalization,parsed:attempt.parsed,criteria:attempt.criteria};
+    const text=pretty(payload)??'未记录',pre=document.createElement('pre');pre.className='json-view';pre.textContent=text;
+    slot.append(pre);slot.dataset.rendered='true';slot.dataset.bytes=String(text.length*2);entry.bytes+=text.length*2;detailBytes+=text.length*2;pruneDetailCache();
+  }
+  function hydrateRunDetails(){
+    if(s.page!==4){pruneDetailCache();return;}
+    for(const outer of root.querySelectorAll('[data-detail-row]')){
+      const entry=detailCache.get(outer.dataset.detailRow),slot=outer.querySelector('[data-detail-slot]');
+      if(entry&&slot&&entry.node?.parentNode!==slot)slot.replaceChildren(detailNode(entry));
+      if(entry&&outer.open){entry.used=++detailClock;for(const section of entry.node.querySelectorAll('[data-attempt-section][open]'))fillDetailSection(section);}
+      const note=outer.querySelector('[data-detail-notice]');if(note)note.textContent=entry?.stale?'当前记录已有更新，以下仍为上次加载的详情；请手动刷新。':'';
+    }
+    pruneDetailCache();
+  }
+  function cacheRecordDetail(rowId,value){
+    const previous=detailCache.get(rowId),reuse=new Map();if(previous){for(const article of previous.node?.querySelectorAll('[data-attempt-id]')||[]){const a=previous.value.attempts.find(v=>v.id===article.dataset.attemptId);reuse.set(article.dataset.attemptId,{node:article,timing:a?.timing});}previous.node?.remove();detailBytes-=previous.bytes;}
+    const row=s.runRows.find(r=>r.row_id===rowId),last=value.attempts.at(-1);
+    const signature=recordSignature({status:value.status,round_no:value.round_no,latest_attempt_id:last?.id||null,attempt_count:value.attempts.length,result_round:last?.round_no,previous_attempt:row?.previous_attempt});
+    const entry={rowId,value,signature,stale:!!row&&signature!==recordSignature(row),used:++detailClock,bytes:estimateDetailBytes(value),node:null,reuse};
+    detailCache.set(rowId,entry);detailBytes+=entry.bytes;hydrateRunDetails();
+  }
+  function resultStateHTML(record){return `${badge(record.status==='pending'&&active(s.run.status)?'等待中':record.status)}<br><small>${record.attempt_count} 次尝试 · 轮次 ${record.round_no??'未记录'}</small>${record.previous_attempt?'<p class="inline-note">下列结论／错误来自上次尝试</p>':''}`;}
+  function resultVerdictHTML(record){return `${record.criteria.length?record.criteria.map(c=>`<div class="verdict-line"><strong>${esc(c.name)}</strong>${badge(c.verdict||'未映射')}</div><p class="reason">${esc(c.reason)}</p>`).join(''):'—'}${record.error?`<p class="error-text">${esc(labels[record.error_stage]||record.error_stage||'错误')}：${esc(record.error)}</p>`:''}`;}
+  function resultRowHTML(record){
+    const r=s.run,paths=r.snapshot.mapping.evaluation_fields;
+    return `<tr data-result-row="${esc(record.row_id)}" data-row-signature="${esc(recordSignature(record))}"><td><input type="checkbox" data-rerun-row="${esc(record.row_id)}" ${s.rerunRows.includes(record.row_id)?'checked':''} ${active(r.status)||readonly()||r.archived_at?'disabled':''} aria-label="复测原始行 ${record.source_row}"></td><td>${record.source_row}<br><code title="${esc(record.row_id)}">${esc(record.row_id.slice(-8))}</code></td>${paths.map(path=>`<td class="material-preview">${resultCell(record,path)}</td>`).join('')}<td data-result-state>${resultStateHTML(record)}</td><td data-result-verdict>${resultVerdictHTML(record)}</td><td><details class="advanced" id="result-${esc(record.row_id)}" data-detail-row="${esc(record.row_id)}"><summary>记录与历次尝试</summary>${button('record-detail','加载 / 刷新详情','',false,`data-row-id="${esc(record.row_id)}"`)}<p data-detail-notice class="inline-note"></p><div data-detail-slot><p class="muted">点击加载当前状态及历次调用；正文在展开时格式化。</p></div></details></td></tr>`;
+  }
+  function runStatusHTML(){
+    const r=s.run,p=r.progress,round=r.round_progress,stage=r.stage_counts||{},percent=p.selected?Math.round(p.processed/p.selected*100):0;
+    const phase=key=>stage.consistent===true&&typeof stage[key]==='number'?stage[key]:'更新中';
+    return `<div class="toolbar">${badge(r.status)}<code>${esc(r.id)}</code><span>整体已处理 ${p.processed}/${p.selected} · 执行成功 ${p.succeeded} · 执行异常 ${p.failed}</span></div><div class="progress"><span style="width:${percent}%"></span></div><div class="run-stages"><span>执行中（请求及解析） <strong>${phase('executing')}</strong></span><span>等待保存 <strong>${phase('saving')}</strong></span><span>${active(r.status)?'待执行':'未执行'} <strong>${p.pending}</strong></span><span>固定并发上限 <strong>${r.execution_config.batch_concurrency}</strong></span></div>${round?`<p class="round-progress">本轮：第 ${round.number} 轮（${round.kind==='retry'?'重试':'首次执行'}） · 已处理 ${round.processed}/${round.selected} · 成功 ${round.succeeded} · 异常 ${round.failed}</p>`:'<p class="inline-note">历史轮次未记录，整体结果仍保留。</p>'}<p class="inline-note">模型配置：${esc(r.snapshot.model_config.profile_name||'纯程序规则')}。执行中不是实时 HTTP 连接数；已处理包含技术失败。${stage.consistent===false?'阶段正在变化，暂不提供确定数量。':''}</p><p class="update-time">服务状态：${esc(stampText(r.updated_at))} · 阶段采集：${esc(stampText(stage.observed_at))}<br>进度读取：${esc(stampText(s.runProgressUpdated))}</p>${s.runProgressError?`<div class="message warning">${esc(s.runProgressError)} 正在退避重试只读查询；显示上次成功数据。</div>`:''}${r.error?`<div class="message error">${esc(r.error)}</div>`:''}${s.cancelPending?'<p class="loading-inline">正在提交取消请求，尚待后端确认；已保存结果保留。</p>':r.status==='cancelling'?'<p class="inline-note">取消已受理，停止新派发，等待在途工作及结果保存。</p>':''}<div class="toolbar">${active(r.status)?button('cancel','取消任务','',readonly()||s.cancelPending||r.status==='cancelling'):button('retry','原配置失败重试','',readonly()||r.archived_at||!r.retryable)}${button('load-run-config','载入本次运行配置','',readonly())}${button('rerun','选中样本新建复测','',!canExecute()||r.archived_at||active(r.status)||!s.rerunRows.length||s.dataset?.id!==r.snapshot.dataset.id)}</div>`;
+  }
+  function runFiltersHTML(){return `<div class="toolbar">${inlineField('结果范围',select('runStatusFilter',[['all','全部'],['errors','执行异常'],['pending','未执行']],s.runStatusFilter))}<span id="run-stage-filter" ${s.runStatusFilter==='errors'?'':'hidden'}>${inlineField('异常阶段',select('runErrorStage',[['','全部阶段'],['call_failed','模型调用'],['parse_failed','JSON 解析'],['schema_failed','Schema 校验'],['projection_failed','结果映射'],['scheduler_failed','调度异常']],s.runErrorStage))}</span><span class="muted">筛选不改变导出范围；内容不通过不是执行异常。</span></div>`;}
+  function runPageNoticeHTML(){
+    const c=resultLoader;
+    return `<p class="update-time">结果页读取：${esc(stampText(s.runPageUpdated))}${s.runPageLoading?' · 正在读取':''}</p>${c?.finalNeeded?`<div class="message ${c.finalFailed?'warning':'info'}">${c.finalFailed?'任务已结束，最终结果页尚未更新。':'任务已结束，正在获取最终结果页。'}${c.finalFailed?button('refresh-results','重试最终结果页'):''}</div>`:''}${c?.successRound!=null&&c.successRound!==s.run?.current_round?'<p class="inline-note">表格仍为上一轮次的页面，正在等待当前轮次更新。</p>':''}${s.runPageError?`<div class="message warning">${esc(s.runPageError)}${button('refresh-results','重试结果页')}</div>`:''}`;
+  }
+  function roundView(){
+    return s.runRounds.length?`<div class="table-scroll"><table><thead><tr><th>轮次</th><th>状态</th><th>已处理 / 本轮数量</th><th>成功 / 异常</th><th>开始 / 结束</th></tr></thead><tbody>${s.runRounds.map(v=>`<tr><td>${v.number} · ${v.kind==='retry'?'重试':'首次执行'}</td><td>${badge(v.status)}</td><td>${v.processed} / ${v.selected}</td><td>${v.succeeded} / ${v.failed}</td><td>${esc(v.started_at||'未开始')}<br>${esc(v.finished_at||'未结束')}</td></tr>`).join('')}</tbody></table></div>`:'<p class="muted">尚未加载；旧运行的历史轮次可能未记录。</p>';
+  }
   function runView(){
-    const r=s.run,p=r.progress,percent=p.selected?Math.round(p.processed/p.selected*100):0;
-    return `<div class="toolbar">${badge(r.status)}<code>${esc(r.id)}</code><span class="muted">已处理 ${p.processed}/${p.selected} · 执行中 ${p.running} · ${['queued','running'].includes(r.status)?'待执行':'未执行'} ${p.pending} · 执行异常 ${p.failed}</span></div><div class="progress"><span style="width:${percent}%"></span></div>${r.error?`<div class="message error">${esc(r.error)}</div>`:''}<p class="inline-note">本次配置：${esc(r.snapshot.model_config.profile_name||'纯程序规则')} · 固定批跑并发数 ${r.execution_config.batch_concurrency}。原配置重试使用本次绑定配置；新建复测使用全局当前配置。</p><div class="toolbar">${active(r.status)?button('cancel','取消任务','',readonly()):button('retry','原配置失败重试','',readonly()||r.archived_at||!r.retryable)}${button('load-run-config','载入本次运行配置','',readonly())}${button('rerun','选中样本新建复测','',!canExecute()||r.archived_at||active(r.status)||!s.rerunRows.length||s.dataset?.id!==r.snapshot.dataset.id)}</div><div class="table-scroll"><table><thead><tr><th>复测</th><th>源行</th><th>执行状态</th><th>逐标准结论与理由</th><th>详情</th></tr></thead><tbody>${s.runRows.map(record=>`<tr><td><input type="checkbox" data-rerun-row="${esc(record.row_id)}" ${s.rerunRows.includes(record.row_id)?'checked':''} ${active(r.status)||readonly()||r.archived_at?'disabled':''} aria-label="复测原始行 ${record.source_row}"></td><td>${record.source_row}<br><code>${esc(record.row_id.slice(-12))}</code></td><td>${badge(record.status==='pending'&&['queued','running'].includes(r.status)?'等待中':record.status)}<br><small>${record.attempt_count} 次尝试</small></td><td>${record.criteria.length?record.criteria.map(c=>`<div class="verdict-line"><strong>${esc(c.name)}</strong>${badge(c.verdict||'未映射')}<small>${c.source==='llm'?'LLM':'程序规则'}</small></div><p class="reason">${esc(c.reason)}</p>`).join(''):'—'}${record.error?`<p class="reason error-text">${esc(record.error)}</p>`:''}</td><td>${detail('result-'+record.row_id,'记录与历次尝试',button('record-detail','加载 / 刷新详情','',false,`data-row-id="${esc(record.row_id)}"`)+(s.runDetails[record.row_id]?json(s.runDetails[record.row_id]):'<p class="muted">按需读取原始记录、响应及解析过程。</p>'))}</td></tr>`).join('')}</tbody></table></div>${pagination(true)}${detail('run-lineage','数据、配置版本及模型指纹',button('load-lineage','加载配置详情')+(s.runLineage?json(s.runLineage):json(r.snapshot)))}`;
+    const r=s.run,paths=r.snapshot.mapping.evaluation_fields;
+    const table=`<table id="run-results-table" class="result-table" style="width:${860+paths.length*220}px;min-width:100%"><colgroup><col style="width:44px"><col style="width:74px">${paths.map(()=>'<col style="width:220px">').join('')}<col style="width:160px"><col style="width:360px"><col style="width:222px"></colgroup><thead><tr><th>复测</th><th>源行</th>${paths.map(path=>`<th title="${esc(path)}">${esc(path)}</th>`).join('')}<th>执行状态</th><th>逐标准结论与理由</th><th>详情</th></tr></thead><tbody id="run-results-body">${s.runRows.map(resultRowHTML).join('')}</tbody></table>`;
+    return `<div id="run-status-region">${runStatusHTML()}</div><p class="inline-note">材料来自本次运行固定字段；表格继续加载完整字段值。</p><div id="run-result-controls">${runFiltersHTML()}</div><div id="run-page-notice">${runPageNoticeHTML()}</div>${scrollTable('result:'+r.id,table)}<div id="run-pagination-region">${pagination(true)}</div>${detail('round-history','执行轮次',button('load-rounds','加载 / 刷新轮次')+`<div id="round-history-content">${roundView()}</div>`)}${detail('run-lineage','数据、配置版本及模型指纹',button('load-lineage','加载配置详情')+`<div id="run-lineage-content">${s.runLineage?json(s.runLineage):'<p class="muted">点击加载固定配置详情。</p>'}</div>`)}`;
+  }
+  function runShellKey(){return s.page===4&&s.project&&s.run?JSON.stringify([s.epoch,s.project.id,s.run.id,s.dataset?.id,s.offset,s.pageSize,s.selectionMode,s.mapping.id,s.mapping.version,s.savedSpec?.id,s.savedSpec?.version,s.evaluator?.id,s.evaluator?.version]):null;}
+  function hasRunDOM(){return s.page===4&&mountedRunKey===runShellKey()&&!!document.getElementById('run-status-region');}
+  function replaceSmallHTML(node,html){if(node&&node.innerHTML!==html)node.innerHTML=html;}
+  function patchRunPageNotice(){if(hasRunDOM())replaceSmallHTML(document.getElementById('run-page-notice'),runPageNoticeHTML());}
+  function patchRunStatus(){
+    if(!hasRunDOM())return;
+    replaceSmallHTML(document.getElementById('run-status-region'),runStatusHTML());
+    for(const node of root.querySelectorAll('[data-action="export-xlsx"],[data-action="export-jsonl"]')){node.dataset.ruleDisabled=String(active(s.run.status));node.disabled=!!s.busy||active(s.run.status);}
+    for(const node of root.querySelectorAll('[data-rerun-row]')){node.disabled=!!s.busy||active(s.run.status)||readonly()||!!s.run.archived_at;node.checked=s.rerunRows.includes(node.dataset.rerunRow);}
+    patchRunPageNotice();
+  }
+  function patchRunFilters(){
+    if(!hasRunDOM())return;
+    for(const key of ['runStatusFilter','runErrorStage']){const node=root.querySelector(`[data-bind="${key}"]`);if(node){node.value=s[key];node.disabled=!!s.busy;}}
+    const stage=document.getElementById('run-stage-filter');if(stage)stage.hidden=s.runStatusFilter!=='errors';
+  }
+  function patchRunPagination(){
+    if(!hasRunDOM())return;const node=document.getElementById('run-pagination-region');
+    if(node.contains(document.activeElement)&&document.activeElement.tagName==='SELECT'){const number=node.querySelector('[data-bind="runPageNumber"]'),size=node.querySelector('[data-bind="runPageSize"]');if(number){number.value=String(Math.floor(s.runOffset/s.runPageSize)+1);number.disabled=!!s.busy||!s.runTotal;}if(size){size.value=String(s.runPageSize);size.disabled=!!s.busy;}return;}
+    replaceSmallHTML(node,pagination(true));
+  }
+  function patchRunRows(){
+    if(!hasRunDOM())return;
+    const body=document.getElementById('run-results-body'),existing=new Map([...body.children].map(n=>[n.dataset.resultRow,n]));
+    s.runRows.forEach((row,index)=>{
+      let node=existing.get(row.row_id);
+      if(!node){const container=document.createElement('tbody');container.innerHTML=resultRowHTML(row);node=container.firstElementChild;}
+      else if(node.dataset.rowSignature!==recordSignature(row)){
+        node.querySelector('[data-result-state]').innerHTML=resultStateHTML(row);
+        node.querySelector('[data-result-verdict]').innerHTML=resultVerdictHTML(row);node.dataset.rowSignature=recordSignature(row);
+      }
+      if(body.children[index]!==node)body.insertBefore(node,body.children[index]||null);existing.delete(row.row_id);
+    });
+    for(const node of existing.values())node.remove();
+    patchRunFilters();patchRunPagination();hydrateRunDetails();patchRunPageNotice();scrollResizers.forEach(sync=>sync());
+  }
+  function patchRunPicker(){
+    if(!hasRunDOM())return;const node=root.querySelector('[data-bind="runChoice"]');if(!node)return;node.disabled=!!s.busy;
+    if(document.activeElement===node)return;
+    const html=select('runChoice',[['','选择项目内运行'],...s.catalog.runs.map(v=>[v.id,`${v.title} · ${labels[v.status]||v.status}`])],s.run.id);
+    const holder=document.createElement('div');holder.innerHTML=html;if(node.innerHTML!==holder.firstElementChild.innerHTML)node.innerHTML=holder.firstElementChild.innerHTML;node.value=s.run.id;
+  }
+  function renderActionState(){
+    if(!hasRunDOM()){render();return;}
+    patchFeedback();patchRunStatus();patchRunFilters();patchRunPagination();patchRunPicker();syncControls();
   }
   function historyPage(){
     const kinds=[['dataset','数据集'],['mapping','字段配置'],['spec','标准方案'],['evaluator','评测器'],['run','运行'],['design_call','设计调用']];
@@ -245,7 +545,7 @@
     return result;
   }
   function settingsPage(){
-    const c=s.connectionForm;if(!c)return empty('正在读取模型设置。');
+    const c=s.connectionForm;if(!c)return panel('模型配置','配置尚未加载，可手动重试读取；不会测试连接。',button('reload-connection','重新读取配置'));
     const selected=s.llm.profiles.find(p=>p.id===s.profileId);
     const controls=`<div class="model-select-row">${inlineField('选择配置',select('profileChoice',[...(!s.profileId?[['','新配置草稿']]:[]),...s.llm.profiles.map(p=>[p.id,p.name])],s.profileId||''))}<span class="model-active">当前使用：${esc(s.llm.active_profile_name||'未选择')}${s.llm.active_profile_id&&!s.llm.configured?'（未就绪）':''}</span></div>`;
     const fields=`<div class="settings-grid">${field('配置名称',input('profileName',s.profileName))}${field('模型 model',input('connectionForm.model',c.model))}<div class="full-width">${field('完整调用地址 api_url',input('connectionForm.api_url',c.api_url,'url','autocomplete="off" placeholder="https://provider.example/v1/chat/completions"'))}</div><div class="full-width">${field('密钥 api_key',input('connectionForm.api_key',c.api_key,'password',`autocomplete="new-password" placeholder="${selected?.api_key_configured?'留空保留此配置的已有密钥':'新配置请填写密钥'}"`))}</div></div><div class="settings-number-grid">${field('输出上限 max_tokens',input('connectionForm.max_tokens',c.max_tokens,'number','min="1"'))}${field('超时 timeout（秒）',input('connectionForm.timeout',c.timeout,'number','min="0.1" step="any"'))}${field('批跑并发数',input('executionForm.batch_concurrency',s.executionForm.batch_concurrency,'number','min="1" max="32" step="1"'),'1–32，默认 1')}</div><div class="check-grid">${check('connectionForm.stream',c.stream,'流式响应 stream')}${check('connectionForm.enable_thinking',c.enable_thinking,'enable_thinking')}${check('connectionForm.skip_special_tokens',c.skip_special_tokens,'skip_special_tokens')}</div>`;
@@ -255,20 +555,22 @@
     const advanced=detail('model-advanced','参数说明与技术详情',`<p class="inline-note">地址不追加路径；密钥不回显。后两个布尔参数通过 extra_body 发送。批跑并发数只控制同一次运行的同时记录数，不是每秒请求数。保存影响后续调用，已提交任务固定原配置。连接测试使用当前表单，不保存、不启用，也不代表评测质量通过。</p><p class="inline-note">${esc(s.llm.message)}</p><h3>当前使用配置的公开参数</h3>${json(s.llm.parameters)}${s.connectionTest?`<h3>连接测试详情</h3>${json(s.connectionTest.trace)}`:''}`);
     return panel('模型配置','所有项目共用；选择配置后可查看、修改参数。',controls+fields+footer+test+advanced);
   }
+  function feedbackHTML(){return `${s.notice?`<div class="message success" role="status"><div>${esc(s.notice)}</div><button data-dismiss="notice" aria-label="关闭提示">×</button></div>`:''}${s.error?`<div class="message error" role="alert"><div>${esc(s.error)}${s.errorTrace?detail('error-trace','错误与调用详情',json(s.errorTrace)):''}</div><button data-dismiss="error" aria-label="关闭错误">×</button></div>`:''}${s.busy?`<div class="loading-inline" role="status"><span class="spinner"></span>${esc(s.busy.label)}</div>`:''}${s.workspaceError&&s.page>0&&s.page<6?`<div class="message warning">${esc(s.workspaceError)}${button('retry-workspace','重试加载')}</div>`:''}`;}
+  function patchFeedback(){replaceSmallHTML(document.getElementById('global-feedback'),feedbackHTML());}
   function render(){
     rememberScroll();
     const opened=[...document.querySelectorAll('details[open][id]')].map(n=>n.id);const focus=document.activeElement?.dataset?.bind;const focusIndex=focus?[...document.querySelectorAll('[data-bind]')].filter(n=>n.dataset.bind===focus).indexOf(document.activeElement):0;const start=focus&&document.activeElement.selectionStart;const end=focus&&document.activeElement.selectionEnd;
-    const needsProject=s.page>0&&s.page<6;const views=[projectPage,dataPage,standardPage,evaluatorPage,executionPage,historyPage,settingsPage];
+    const needsProject=s.page>0&&s.page<6;const views=[projectPage,dataPage,standardPage,evaluatorPage,executionPage,historyPage,modelPageMarkup];
     const projectOptions=[...s.projects];if(s.project&&!projectOptions.some(p=>p.id===s.project.id))projectOptions.push(s.project);
-    root.innerHTML=`<div class="app-shell"><aside class="sidebar"><a class="brand" href="#" data-page="0">Eval Studio<small>LLM 评测工作台 · v1.1</small></a><nav aria-label="主要功能">${pages.map((p,i)=>`<button class="nav-item ${s.page===i?'active':''}" data-page="${i}" ${i>0&&i<6&&!s.project?'disabled':''}>${p[0]}</button>`).join('')}</nav><div class="sidebar-note">项目独立保存业务记录<br>模型连接全局共用<br>执行后基本预览，导出后分析<br><a href="/help/deployment" target="_blank" rel="noreferrer">Python 部署说明 ↗</a></div></aside><div class="main-shell"><header class="topbar"><div class="project-picker"><span class="muted">当前项目</span>${select('projectChoice',[['','选择项目'],...projectOptions.map(p=>[p.id,p.name+(p.archived_at?'（已归档）':'')])],s.project?.id||'')}</div><div class="topbar-actions"><span class="muted">${s.online?'服务已连接':'等待连接'} · 当前模型配置：${esc(s.llm.active_profile_name||'未选择')}</span><button class="button" data-help="${helpSections[s.page]}">? 使用帮助</button></div></header><main><header class="page-heading"><div><div class="eyebrow">EVALUATION WORKSPACE / V1.1</div><h1>${pages[s.page][0]}</h1><p>${pages[s.page][1]}</p></div>${s.project&&needsProject?badge(s.project.name):''}</header>${s.project?.archived_at&&needsProject?'<div class="message warning">项目已归档，仅可查看历史和导出。恢复项目后才能编辑或执行。</div>':''}${s.notice?`<div class="message success" role="status"><div>${esc(s.notice)}</div><button data-dismiss="notice" aria-label="关闭提示">×</button></div>`:''}${s.error?`<div class="message error" role="alert"><div>${esc(s.error)}${s.errorTrace?detail('error-trace','错误与调用详情',json(s.errorTrace)):''}</div><button data-dismiss="error" aria-label="关闭错误">×</button></div>`:''}${s.busy?`<div class="loading-inline" role="status"><span class="spinner"></span>${esc(s.busy.label)}</div>`:''}${needsProject&&!s.project?empty('请先创建或打开项目。'):views[s.page]()}<footer class="app-footer"><span>Eval Studio · 数据与配置版本随运行保存</span><span>Python 服务 · 源码直接部署</span></footer></main></div></div>${s.help?`<div class="help-overlay" data-help-overlay="true"><aside class="help-drawer" role="dialog" aria-modal="true" aria-label="使用帮助"><header class="help-heading"><strong>使用帮助</strong><div class="button-group"><a class="button small" href="/help/tutorial#${esc(s.help)}" target="_blank" rel="noreferrer">新标签打开 ↗</a><button class="button small" data-help-close="true" aria-label="关闭帮助">关闭 ×</button></div></header><iframe title="Eval Studio 操作教程" src="/help/tutorial#${esc(s.help)}"></iframe></aside></div>`:''}`;
+    root.innerHTML=`<div class="app-shell"><aside class="sidebar"><a class="brand" href="#" data-page="0">Eval Studio<small>LLM 评测工作台 · v1.1</small></a><nav aria-label="主要功能">${pages.map((p,i)=>`<button class="nav-item ${s.page===i?'active':''}" data-page="${i}" ${i>0&&i<6&&!s.project?'disabled':''}>${p[0]}</button>`).join('')}</nav><div class="sidebar-note">项目独立保存业务记录<br>模型连接全局共用<br>执行后基本预览，导出后分析<br><a href="/help/deployment" target="_blank" rel="noreferrer">Python 部署说明 ↗</a></div></aside><div class="main-shell"><header class="topbar"><div class="project-picker"><span class="muted">当前项目</span>${select('projectChoice',[['','选择项目'],...projectOptions.map(p=>[p.id,p.name+(p.archived_at?'（已归档）':'')])],s.project?.id||'')}</div><div class="topbar-actions"><span class="muted" id="global-model-state">${s.online?'服务已连接':'等待连接'} · 当前模型配置：${esc(s.llm.active_profile_name||'未选择')}</span><button class="button" data-help="${helpSections[s.page]}">? 使用帮助</button></div></header><main><header class="page-heading"><div><div class="eyebrow">EVALUATION WORKSPACE / V1.1</div><h1>${pages[s.page][0]}</h1><p>${pages[s.page][1]}</p></div>${s.project&&needsProject?badge(s.project.name):''}</header>${s.project?.archived_at&&needsProject?'<div class="message warning">项目已归档，仅可查看历史和导出。恢复项目后才能编辑或执行。</div>':''}<div id="global-feedback">${feedbackHTML()}</div>${needsProject&&!s.project?empty('请先创建或打开项目。'):views[s.page]()}<footer class="app-footer"><span>Eval Studio · 数据与配置版本随运行保存</span><span>Python 服务 · 源码直接部署</span></footer></main></div></div>${s.help?`<div class="help-overlay" data-help-overlay="true"><aside class="help-drawer" role="dialog" aria-modal="true" aria-label="使用帮助"><header class="help-heading"><strong>使用帮助</strong><div class="button-group"><a class="button small" href="/help/tutorial#${esc(s.help)}" target="_blank" rel="noreferrer">新标签打开 ↗</a><button class="button small" data-help-close="true" aria-label="关闭帮助">关闭 ×</button></div></header><iframe title="Eval Studio 操作教程" src="/help/tutorial#${esc(s.help)}"></iframe></aside></div>`:''}`;
     if(s.cellViewer)root.insertAdjacentHTML('beforeend',`<div class="cell-overlay" data-cell-overlay="true"><section class="cell-dialog" role="dialog" aria-modal="true" aria-label="完整单元格内容"><header><strong>${esc(s.cellViewer.title)}</strong><button type="button" class="button small" data-cell-close="true">关闭</button></header><pre class="cell-dialog-content">${esc(s.cellViewer.text)}</pre></section></div>`);
     for(const id of opened){const el=document.getElementById(id);if(el)el.open=true;}
     const archivedEdit=(s.page===1&&(s.dataset?.archived_at||s.mapping.archived_at))||(s.page===2&&s.savedSpec?.archived_at)||(s.page===3&&s.evaluator?.archived_at);
-    if((readonly()||archivedEdit)&&s.page>0&&s.page<5){for(const node of root.querySelectorAll('[data-bind]')){const bind=node.dataset.bind;if(!['projectChoice','datasetChoice','specChoice','evaluatorChoice','runChoice','sampleId','customExport','includeRaw','pageSize','runPageSize','pageNumber','runPageNumber'].includes(bind)&&!bind.startsWith('compare.'))node.disabled=true;}}
+    if((readonly()||archivedEdit)&&s.page>0&&s.page<5){for(const node of root.querySelectorAll('[data-bind]')){const bind=node.dataset.bind;if(!['projectChoice','datasetChoice','specChoice','evaluatorChoice','runChoice','sampleId','customExport','includeRaw','pageSize','runPageSize','pageNumber','runPageNumber','runStatusFilter','runErrorStage'].includes(bind)&&!bind.startsWith('compare.'))node.disabled=true;}}
     if(focus){const nodes=[...root.querySelectorAll('[data-bind]')].filter(n=>n.dataset.bind===focus);const node=nodes[focusIndex]||nodes[0];if(node){node.focus();if(typeof start==='number'&&node.setSelectionRange&&['text','search','url','password','textarea'].includes(node.type))node.setSelectionRange(start,end);}}
-    syncControls();connectScrollbars();
+    mountedRunKey=runShellKey();syncControls();connectScrollbars();hydrateRunDetails();resumeRunRows();
   }
-  function setConnection(value,id=undefined){s.llm=value;const selected=value.profiles.find(p=>p.id===(id===undefined?(s.profileId||value.active_profile_id):id))||value.profiles.find(p=>p.id===value.active_profile_id)||value.profiles[0];if(selected){s.profileId=selected.id;s.profileName=selected.name;s.connectionForm={...selected.settings,api_key:''};s.executionForm=clone(selected.execution||{batch_concurrency:1});}else{s.profileId=null;s.profileName='';s.connectionForm={api_url:'',api_key:'',model:'',max_tokens:4096,timeout:120,stream:false,enable_thinking:false,skip_special_tokens:false};s.executionForm={batch_concurrency:1};}s.connectionDirty=false;s.connectionTest=null;}
+  function setConnection(value,id=undefined){++connectionRevision;s.modelLoad={status:'success',error:''};s.llm=value;const selected=value.profiles.find(p=>p.id===(id===undefined?(s.profileId||value.active_profile_id):id))||value.profiles.find(p=>p.id===value.active_profile_id)||value.profiles[0];if(selected){s.profileId=selected.id;s.profileName=selected.name;s.connectionForm={...selected.settings,api_key:''};s.executionForm=clone(selected.execution||{batch_concurrency:1});}else{s.profileId=null;s.profileName='';s.connectionForm={api_url:'',api_key:'',model:'',max_tokens:4096,timeout:120,stream:false,enable_thinking:false,skip_special_tokens:false};s.executionForm={batch_concurrency:1};}s.connectionDirty=false;s.connectionTest=null;}
   function chooseProfile(id){if(s.connectionDirty&&!window.confirm('切换编辑对象会放弃未保存的模型配置，是否继续？'))return;setConnection(s.llm,id);}
   const actions={
     'new-mapping':()=>{invalidatePreview();s.mapping={dataset_id:s.dataset.id,evaluation_fields:[...s.mapping.evaluation_fields]};s.mappingDirty=true;},
@@ -286,7 +588,7 @@
     previous:()=>loadDataset(s.dataset,Math.max(0,s.offset-s.pageSize)),next:()=>loadDataset(s.dataset,s.offset+s.pageSize),
     'run-previous':()=>loadRunRows(Math.max(0,s.runOffset-s.runPageSize)),'run-next':()=>loadRunRows(s.runOffset+s.runPageSize),
     'save-mapping':async()=>{s.mapping=await papi('/mappings','POST',{id:s.mapping.id||null,dataset_id:s.dataset.id,evaluation_fields:s.mapping.evaluation_fields});s.mappingDirty=false;remember('mapping',s.mapping);await refresh();s.notice='字段配置已保存，所有标准共用这份清单。';},
-    'new-spec':()=>{invalidatePreview();s.savedSpec=null;s.title='新的评测方案';s.generationPrompt='';s.designNotes='';s.criteria=[blankCriterion()];s.designCallIds=[];s.specDirty=false;s.analysis=null;s.specVersions=[];},
+    'new-spec':()=>{s.configRestored=true;invalidatePreview();s.savedSpec=null;s.title='新的评测方案';s.generationPrompt='';s.designNotes='';s.criteria=[blankCriterion()];s.designCallIds=[];s.specDirty=false;s.analysis=null;s.specVersions=[];},
     'copy-spec':()=>{invalidatePreview();s.savedSpec=null;s.title+=' 副本';s.criteria=s.criteria.map(({id,...c})=>clone(c));s.specDirty=true;s.specVersions=[];s.analysis=null;s.notice='已复制为未保存的新方案；原方案不变。保存后从 v1 开始，并自动准备评测器。';},
     'copy-evaluator':()=>{++s.evaluatorRevision;const value=clone(s.evaluator);for(const key of ['id','version','project_id','kind','created_at','archived_at'])delete value[key];value.title+=' 副本';s.evaluator=value;s.evaluatorDirty=true;s.evaluatorVersions=[];invalidatePreview();s.notice='已复制为新评测器草稿，仍绑定原标准版本。保存后从 v1 开始。';schedulePreview();},
     'add-criterion':()=>{s.criteria.push(blankCriterion());s.specDirty=true;},
@@ -301,37 +603,40 @@
     'load-version':async el=>{const kind=el.dataset.kind;const id=kind==='spec'?s.savedSpec.id:s.evaluator.id;const v=await papi(`/entities/${id}?version=${el.dataset.version}`);if(kind==='spec'){setSpec(v);await ensureEvaluator();}else await openEvaluator(v);},
     'compare-versions':async el=>{const kind=el.dataset.kind;const id=kind==='spec'?s.savedSpec.id:s.evaluator.id;const c=s.compare[kind];c.result=await papi(`/entities/${id}/compare?left=${c.left}&right=${c.right}`);},
     trial:()=>startRun(true),run:()=>startRun(false),
-    'refresh-run':async()=>{await refresh();if(s.run)await loadRun(s.run.id);},
-    cancel:async()=>{await papi(`/runs/${s.run.id}/cancel`,'POST');await loadRun(s.run.id);},
-    retry:async()=>{await papi(`/runs/${s.run.id}/retry`,'POST');await loadRun(s.run.id);await refresh();},
-    rerun:async()=>{const v=await papi(`/runs/${s.run.id}/rerun`,'POST',{...contextBody(),row_ids:s.rerunRows});await loadRun(v.id);await refresh();},
-    'load-run-config':async()=>{const config=await papi(`/runs/${s.run.id}/configuration`),snap=config.snapshot;await loadDataset(await papi(`/entities/${snap.dataset.id}`));s.mapping=await papi(`/entities/${snap.mapping.id}?version=${snap.mapping.version}`);s.mappingDirty=false;remember('mapping',s.mapping);setSpec(await papi(`/entities/${snap.spec.id}?version=${snap.spec.version}`));await openEvaluator(await papi(`/entities/${snap.evaluator.id}?version=${snap.evaluator.version}`));s.selected=config.row_ids;s.notice='已载入本次运行的业务配置。全局模型选择保持不变；归档对象需恢复后才能执行。';},
-    'record-detail':async el=>{const id=s.run.id,row=el.dataset.rowId;const value=await papi(`/runs/${id}/records/${encodeURIComponent(row)}`);if(s.run?.id===id)s.runDetails[row]=value;},
-    'load-lineage':async()=>{const id=s.run.id;const value=await papi(`/runs/${id}/configuration`);if(s.run?.id===id)s.runLineage=value.snapshot;},
+    'refresh-results':()=>loadRunRows(),
+    'refresh-run':async()=>{if(s.run){await loadRun(s.run.id);await loadRunRows();}else await ensureWorkspace(4);},
+    'retry-workspace':()=>ensureWorkspace(s.page),
+    'load-rounds':async()=>{const id=s.run.id,value=await papi(`/runs/${id}/rounds`);if(s.run?.id===id){s.runRounds=value.rounds;replaceSmallHTML(document.getElementById('round-history-content'),roundView());}},
+    cancel:async()=>{const id=s.run.id;s.cancelPending=true;patchRunStatus();try{const value=await papi(`/runs/${id}/cancel`,'POST');if(s.run?.id===id){acceptRun({...s.run,...value});s.notice='取消已受理，等待在途请求及结果保存后结束；已有结果保留。';await loadRun(id);}}finally{s.cancelPending=false;}},
+    retry:async()=>{const id=s.run.id,value=await papi(`/runs/${id}/retry`,'POST');if(s.run?.id===id)acceptRun({...s.run,...value});await loadRun(id);await refresh();},
+    rerun:async()=>{const v=await papi(`/runs/${s.run.id}/rerun`,'POST',{...contextBody(),row_ids:s.rerunRows});await openSubmittedRun(v);},
+    'load-run-config':async()=>{const config=await papi(`/runs/${s.run.id}/configuration`),snap=config.snapshot;await loadDataset(await papi(`/entities/${snap.dataset.id}?version=${snap.dataset.version}`));s.mapping=await papi(`/entities/${snap.mapping.id}?version=${snap.mapping.version}`);s.mappingDirty=false;remember('mapping',s.mapping);setSpec(await papi(`/entities/${snap.spec.id}?version=${snap.spec.version}`));await openEvaluator(await papi(`/entities/${snap.evaluator.id}?version=${snap.evaluator.version}`));s.selected=config.row_ids;s.notice='已载入本次运行的业务配置。全局模型选择保持不变；归档对象需恢复后才能执行。';},
+    'record-detail':async el=>{const id=s.run.id,row=el.dataset.rowId,round=s.run.current_round,epoch=s.epoch;const value=await papi(`/runs/${id}/records/${encodeURIComponent(row)}`);if(s.epoch===epoch&&s.run?.id===id&&s.run.current_round===round)cacheRecordDetail(row,value);},
+    'load-lineage':async()=>{const id=s.run.id;const value=await papi(`/runs/${id}/configuration`);if(s.run?.id===id){s.runLineage=value.snapshot;replaceSmallHTML(document.getElementById('run-lineage-content'),json(s.runLineage));}},
     'export-xlsx':()=>download('xlsx'),'export-jsonl':()=>download('jsonl'),
     'history-refresh':loadHistory,
     'history-detail':async el=>{s.historyDetail=await papi(`/history/${el.dataset.kind}/${el.dataset.id}`);},
     'history-lifecycle':async el=>{await papi(`/history/${el.dataset.kind}/${el.dataset.id}/${el.dataset.restore==='true'?'restore':'archive'}`,'POST');await refresh();await loadHistory();for(const v of [s.dataset,s.mapping,s.savedSpec,s.evaluator,s.run])if(v?.id===el.dataset.id)v.archived_at=el.dataset.restore==='true'?null:new Date().toISOString();},
-    'history-delete':async el=>{const owned=el.dataset.kind==='dataset'?'包括该数据集的字段配置版本和上传副本':el.dataset.kind==='run'?'包括运行的全部尝试和所属导出文件':'包括此对象的全部版本';if(!window.confirm(`永久删除 ${el.dataset.id}？\n${owned}。存在引用会拒绝删除。`))return;const result=await papi(`/history/${el.dataset.kind}/${el.dataset.id}`,'DELETE',{confirm_id:el.dataset.id});if(s.dataset?.id===el.dataset.id){s.dataset=null;s.rows=[];s.mapping={evaluation_fields:[]};s.mappingDirty=false;s.selected=[];}if(s.mapping?.id===el.dataset.id){s.mapping={evaluation_fields:[]};s.mappingDirty=false;}if(s.savedSpec?.id===el.dataset.id)actions['new-spec']();if(s.evaluator?.id===el.dataset.id){s.evaluator=null;s.evaluatorDirty=false;}if(s.run?.id===el.dataset.id){s.run=null;s.activeRunId=null;}s.historyDetail=null;await refresh();await loadHistory();s.notice=result.file_cleanup_pending?'对象已删除，部分暂存文件待清理。':'对象及所属文件已删除。';},
+    'history-delete':async el=>{const owned=el.dataset.kind==='dataset'?'包括该数据集的字段配置版本和上传副本':el.dataset.kind==='run'?'包括运行的全部尝试和所属导出文件':'包括此对象的全部版本';if(!window.confirm(`永久删除 ${el.dataset.id}？\n${owned}。存在引用会拒绝删除。`))return;const result=await papi(`/history/${el.dataset.kind}/${el.dataset.id}`,'DELETE',{confirm_id:el.dataset.id});if(s.dataset?.id===el.dataset.id){s.dataset=null;s.rows=[];s.mapping={evaluation_fields:[]};s.mappingDirty=false;s.selected=[];}if(s.mapping?.id===el.dataset.id){s.mapping={evaluation_fields:[]};s.mappingDirty=false;}if(s.savedSpec?.id===el.dataset.id)actions['new-spec']();if(s.evaluator?.id===el.dataset.id){s.evaluator=null;s.evaluatorDirty=false;}if(s.run?.id===el.dataset.id){disposeResultLoader();clearDetailCache();s.run=null;s.activeRunId=null;s.runRows=[];s.runPageUpdated=null;}s.historyDetail=null;await refresh();await loadHistory();s.notice=result.file_cleanup_pending?'对象已删除，部分暂存文件待清理。':'对象及所属文件已删除。';},
     'history-open':async()=>{const v=s.historyDetail.object,kind=v.kind||'run';if(dirty()&&!window.confirm('打开历史对象将替换相关草稿，是否继续？'))return;if(kind==='dataset'){await loadDataset(v);s.page=1;}else if(kind==='mapping'){await loadDataset(await papi(`/entities/${v.dataset_id}`));s.mapping=clone(v);s.mappingDirty=false;remember('mapping',v);s.page=1;}else if(kind==='spec'){setSpec(v);await ensureEvaluator();s.page=2;}else if(kind==='evaluator'){await openEvaluator(v);s.page=3;}else if(kind==='run'){await loadRun(v.id);s.page=4;}else if(kind==='design_call'){actions['new-spec']();s.generationPrompt=v.input_snapshot?.generation_prompt||'';s.criteria=v.result.criteria.map(c=>({...c,schemaText:pretty(c.rule_schema)}));s.designCallIds=[v.id];s.specDirty=true;s.page=2;s.notice='已恢复为未保存候选草稿，尚未创建标准版本。';}},
     'edit-profile':el=>chooseProfile(el.dataset.profileId),
-    'new-profile':()=>{if(s.connectionDirty&&!window.confirm('新建将放弃当前未保存配置，是否继续？'))return;s.profileId=null;s.profileName='';s.connectionForm={api_url:'',api_key:'',model:'',max_tokens:4096,timeout:120,stream:false,enable_thinking:false,skip_special_tokens:false};s.executionForm={batch_concurrency:1};s.connectionDirty=true;s.connectionTest=null;},
-    'save-as-profile':()=>{s.profileId=null;s.profileName=(s.profileName||'配置')+' 副本';s.connectionForm={...s.connectionForm,api_key:''};s.connectionDirty=true;s.connectionTest=null;s.notice='已复制为新配置草稿，请填写新名称和密钥后保存；不会自动启用。';},
+    'new-profile':()=>{if(s.connectionDirty&&!window.confirm('新建将放弃当前未保存配置，是否继续？'))return;++connectionRevision;s.profileId=null;s.profileName='';s.connectionForm={api_url:'',api_key:'',model:'',max_tokens:4096,timeout:120,stream:false,enable_thinking:false,skip_special_tokens:false};s.executionForm={batch_concurrency:1};s.connectionDirty=true;s.connectionTest=null;},
+    'save-as-profile':()=>{++connectionRevision;s.profileId=null;s.profileName=(s.profileName||'配置')+' 副本';s.connectionForm={...s.connectionForm,api_key:''};s.connectionDirty=true;s.connectionTest=null;s.notice='已复制为新配置草稿，请填写新名称和密钥后保存；不会自动启用。';},
     'save-connection':async()=>{const value=await api('/llm/profiles'+(s.profileId?'/'+s.profileId:''),s.profileId?'PUT':'POST',{name:s.profileName,...s.connectionForm,execution:s.executionForm});setConnection(value,value.profile_id);s.notice='配置已保存。是否用于后续调用由“设为当前使用”决定；编辑当前配置会更新后续调用参数。';},
     'activate-profile':async()=>{if(s.connectionDirty)throw new Error('请先保存修改再启用。');setConnection(await api(`/llm/profiles/${s.profileId}/activate`,'POST'),s.profileId);s.notice='已切换全局当前配置，已提交任务继续使用原连接。';invalidatePreview();},
     'delete-profile':async()=>{if(!window.confirm(`删除配置「${s.profileName}」？${s.profileId===s.llm.active_profile_id?'当前全局选择将被清除。':''}已提交任务继续执行；历史运行保留公开快照，但此配置将不能用于原配置重试。`))return;setConnection(await api(`/llm/profiles/${s.profileId}`,'DELETE'),null);},
     'test-connection':async()=>{s.connectionTest=await api('/llm/test','POST',{...s.connectionForm,profile_id:s.profileId});},
-    'reload-connection':async()=>{if(s.connectionDirty&&!window.confirm('重新读取将丢弃未保存的模型设置，是否继续？'))return;setConnection(await api('/llm/profiles'));},
+    'reload-connection':async()=>{if(s.connectionDirty&&!window.confirm('重新读取将丢弃未保存的模型设置，是否继续？'))return;await loadModelSettings(true);},
     'clear-key':async()=>{if(!window.confirm('清除此配置密钥？绑定该配置的后续模型调用及原配置重试将不可用，其他配置不受影响。'))return;setConnection(await api(`/llm/profiles/${s.profileId}/clear-key`,'POST'),s.profileId);},
   };
   async function download(format){const epoch=s.epoch,pid=s.project.id;const response=await fetch(`/api/v1/projects/${pid}/runs/${s.run.id}/export`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format,original_fields:s.customExport?s.exportColumns:null,include_raw_response:s.includeRaw})});if(epoch!==s.epoch)throw new StaleResponse();if(!response.ok)throw new Error((await response.json()).detail);const blob=await response.blob();if(epoch!==s.epoch)throw new StaleResponse();const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`${s.run.id}.${format}`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);s.notice='已导出，并在当前项目的运行中登记文件。';await loadRun(s.run.id);}
   function bind(target){
-    const path=target.dataset.bind;if(!path||['projectChoice','datasetChoice','mappingChoice','specChoice','evaluatorChoice','runChoice','profileChoice','pageSize','runPageSize','pageNumber','runPageNumber'].includes(path))return;
+    const path=target.dataset.bind;if(!path||['projectChoice','datasetChoice','mappingChoice','specChoice','evaluatorChoice','runChoice','profileChoice','pageSize','runPageSize','pageNumber','runPageNumber','runStatusFilter','runErrorStage'].includes(path))return;
     const value=target.type==='checkbox'?target.checked:target.type==='number'?Number(target.value):target.value;
     let obj=s;const keys=path.split('.');for(const k of keys.slice(0,-1))obj=obj[k];obj[keys.at(-1)]=value;
     if(path.startsWith('criteria.')||['title','generationPrompt','designNotes'].includes(path)){s.specDirty=true;if(path.startsWith('criteria.'))schedulePreview();}
     if(path.startsWith('evaluator.')||['schemaText','projectionText','exampleText'].includes(path)){s.evaluatorDirty=true;++s.evaluatorRevision;if(path!=='evaluator.title')s.example=null;schedulePreview();}
-    if(path.startsWith('connectionForm.')||path.startsWith('executionForm.')||path==='profileName'){s.connectionDirty=true;s.connectionTest=null;}
+    if(path.startsWith('connectionForm.')||path.startsWith('executionForm.')||path==='profileName'){++connectionRevision;s.connectionDirty=true;s.connectionTest=null;}
   }
   function syncControls(){const disabled={
     'save-project':!s.projectForm?.name?.trim(),
@@ -345,41 +650,56 @@
     preview:!canPreview(),trial:!canExecute()||!s.selected.length,
     run:!canExecute()||(s.selectionMode==='all'?!s.allConfirmed:!s.selected.length),
     rerun:!canExecute()||!s.run||s.run.archived_at||active(s.run.status)||!s.rerunRows.length||s.dataset?.id!==s.run.snapshot.dataset.id,
-  };for(const node of document.querySelectorAll('[data-connection-state]'))node.textContent=s.connectionDirty?'有未保存修改；保存后再使用。':'选择只加载参数，保存不自动启用。';for(const el of document.querySelectorAll('button[data-action]'))if(Object.hasOwn(disabled,el.dataset.action))el.disabled=!!(s.busy||disabled[el.dataset.action]);for(const el of document.querySelectorAll('[data-save-state]')){const k=el.dataset.saveState;const v=k==='spec'?s.savedSpec:s[k];el.textContent=s[k+'Dirty']?'有未保存修改':v?.id?`已保存 v${v.version}`:'尚未保存';}}
+  };for(const node of document.querySelectorAll('[data-connection-state]'))node.textContent=s.connectionDirty?'有未保存修改；保存后再使用。':'选择只加载参数，保存不自动启用。';for(const el of document.querySelectorAll('button[data-action]')){const base=Object.hasOwn(disabled,el.dataset.action)?disabled[el.dataset.action]:el.dataset.ruleDisabled==='true';el.disabled=!!(s.busy||base);}for(const el of document.querySelectorAll('[data-save-state]')){const k=el.dataset.saveState;const v=k==='spec'?s.savedSpec:s[k];el.textContent=s[k+'Dirty']?'有未保存修改':v?.id?`已保存 v${v.version}`:'尚未保存';}}
   document.addEventListener('input',e=>{bind(e.target);syncControls();});
   document.addEventListener('change',async e=>{const t=e.target,d=t.dataset;
     if(d.file){const file=t.files[0];if(file)await action('file','读取文件',async()=>{if(d.file==='prompt'){s.generationPrompt=await file.text();s.specDirty=true;}else await chooseFile(file);});return;}
     if(d.bind==='profileChoice'){await action('choose-profile','加载模型配置',()=>chooseProfile(t.value));return;}
     if(d.bind==='pageNumber'){await action('page-number','加载数据页',()=>loadDataset(s.dataset,(Number(t.value)-1)*s.pageSize));return;}
-    if(d.bind==='runPageNumber'){await action('run-page-number','加载结果页',()=>loadRunRows((Number(t.value)-1)*s.runPageSize));return;}
+    if(d.bind==='runPageNumber'){const page=Number(t.value),size=s.runPageSize;await action('run-page-number','加载结果页',()=>loadRunRows((page-1)*size));return;}
+    if(['runStatusFilter','runErrorStage'].includes(d.bind)){if(d.bind==='runStatusFilter'){s.runStatusFilter=t.value;s.runErrorStage='';}else s.runErrorStage=t.value;patchRunFilters();await action('filter-results','筛选结果',()=>loadRunRows(0));return;}
     if(d.bind==='projectChoice'){await action('open-project','打开项目',()=>switchProject(t.value));return;}
-    const loaders={mappingChoice:()=>{s.mapping=clone(s.catalog.mappings.find(v=>v.id===t.value));s.mappingDirty=false;s.preview=null;remember('mapping',s.mapping);},datasetChoice:()=>loadDataset(s.catalog.datasets.find(v=>v.id===t.value)),specChoice:async()=>{setSpec(s.catalog.specs.find(v=>v.id===t.value));await ensureEvaluator();},evaluatorChoice:()=>openEvaluator(s.catalog.evaluators.find(v=>v.id===t.value)),runChoice:()=>loadRun(t.value)};
+    const loaders={mappingChoice:()=>{s.mapping=clone(s.catalog.mappings.find(v=>v.id===t.value));s.mappingDirty=false;s.preview=null;remember('mapping',s.mapping);},datasetChoice:()=>loadDataset(s.catalog.datasets.find(v=>v.id===t.value)),specChoice:async()=>{s.configRestored=true;setSpec(await papi(`/entities/${t.value}`));await ensureEvaluator();},evaluatorChoice:()=>openEvaluator(s.catalog.evaluators.find(v=>v.id===t.value)),runChoice:()=>loadRun(t.value)};
     if(loaders[d.bind]){if(['specChoice','evaluatorChoice'].includes(d.bind)&&dirty()&&!window.confirm('切换将放弃相关未保存草稿，是否继续？')){render();return;}if(t.value)await action('open','加载保存内容',loaders[d.bind]);return;}
     if(d.field!==undefined){invalidatePreview();s.mapping.evaluation_fields=s.mapping.evaluation_fields.filter(v=>v!==d.field);if(t.checked)s.mapping.evaluation_fields.push(d.field);s.mappingDirty=true;s.preview=null;}
-    if(d.row)s.selected=t.checked?[...new Set([...s.selected,d.row])]:s.selected.filter(v=>v!==d.row);
-    if(d.rerunRow)s.rerunRows=t.checked?[...new Set([...s.rerunRows,d.rerunRow])]:s.rerunRows.filter(v=>v!==d.rerunRow);
+    if(d.row){s.selected=t.checked?[...new Set([...s.selected,d.row])]:s.selected.filter(v=>v!==d.row);const summary=root.querySelector('[data-sample-selection]');if(summary)summary.textContent=`已勾选 ${s.selected.length} 条${s.selected[0]?'；试评首条 ID：'+s.selected[0]:''}`;syncControls();return;}
+    if(d.rerunRow){s.rerunRows=t.checked?[...new Set([...s.rerunRows,d.rerunRow])]:s.rerunRows.filter(v=>v!==d.rerunRow);patchRunStatus();syncControls();return;}
     if(d.exportColumn!==undefined)s.exportColumns=t.checked?[...new Set([...s.exportColumns,d.exportColumn])]:s.exportColumns.filter(v=>v!==d.exportColumn);
     bind(t);
     if(d.bind==='pageSize'){await action('page-size','加载数据页',()=>loadDataset(s.dataset,0,Number(t.value)));return;}
-    if(d.bind==='runPageSize'){await action('run-page-size','加载结果页',()=>loadRunRows(0,Number(t.value)));return;}
+    if(d.bind==='runPageSize'){const size=Number(t.value);await action('run-page-size','加载结果页',()=>loadRunRows(0,size));return;}
     if(d.bind==='sampleId'||d.field!==undefined)schedulePreview();
     if(['historyKind','includeArchived'].includes(d.bind)){s.historyDetail=null;await action('history-refresh','加载历史',loadHistory);return;}
     if(d.bind==='showArchivedProjects'){await action('filter-projects','加载项目',loadProjects);return;}
+    if(s.page===4&&(d.exportColumn!==undefined||['includeRaw','allConfirmed'].includes(d.bind))){syncControls();return;}
     if(t.tagName==='SELECT'||['checkbox','radio'].includes(t.type))render();else syncControls();
   });
   document.addEventListener('click',async e=>{
     if(e.target.closest?.('[data-cell-close]')||e.target.dataset.cellOverlay){closeCell();return;}
-    const cell=e.target.closest?.('[data-view-cell]');if(cell){const row=s.rows.find(r=>r.row_id===cell.dataset.cellRow);if(!row)return;const key=cell.dataset.cellKey,value=cell.dataset.viewCell==='sample'?getAt(row.original,key):Object.hasOwn(row.original,key)?row.original[key]:undefined;s.cellViewer={title:`源行 ${row.source_row} · ${key}`,rowId:row.row_id,key,kind:cell.dataset.viewCell,text:value===undefined?'该记录不存在此字段。':typeof value==='string'?value:pretty(value)};render();document.querySelector('[data-cell-close]')?.focus();return;}
+    const cell=e.target.closest?.('[data-view-cell]');if(cell){const isResult=cell.dataset.viewCell==='result';const row=(isResult?s.runRows:s.rows).find(r=>r.row_id===cell.dataset.cellRow);if(!row)return;const key=cell.dataset.cellKey,value=isResult?(row.missing_fields.includes(key)?undefined:row.fields[key]):cell.dataset.viewCell==='sample'?getAt(row.original,key):Object.hasOwn(row.original,key)?row.original[key]:undefined;s.cellViewer={title:`源行 ${row.source_row} · ${key}`,rowId:row.row_id,key,kind:cell.dataset.viewCell,text:value===undefined?'该记录不存在此字段。':typeof value==='string'?value:pretty(value)};render();document.querySelector('[data-cell-close]')?.focus();return;}
     const close=e.target.closest?.('[data-help-close]');if(close||e.target.dataset.helpOverlay){s.help=null;render();return;}
     const help=e.target.closest?.('[data-help]');if(help){s.help=help.dataset.help;render();document.querySelector('[data-help-close]')?.focus();return;}
-    const dismiss=e.target.closest?.('[data-dismiss]');if(dismiss){s[dismiss.dataset.dismiss]='';render();return;}
-    const nav=e.target.closest?.('[data-page]');if(nav&&!nav.disabled){e.preventDefault();if(s.busy)return;invalidatePreview();s.page=Number(nav.dataset.page);if(s.page===0)await action('projects','加载项目',loadProjects);else if(s.page===5)await action('history-refresh','加载历史',loadHistory);else if(s.page===3)await action('prepare-evaluator','准备评测消息',ensureEvaluator);else render();return;}
+    const dismiss=e.target.closest?.('[data-dismiss]');if(dismiss){s[dismiss.dataset.dismiss]='';if(hasRunDOM())patchFeedback();else render();return;}
+    const nav=e.target.closest?.('[data-page]');if(nav&&!nav.disabled){e.preventDefault();if(s.busy)return;invalidatePreview();s.page=Number(nav.dataset.page);if(s.page===0)await action('projects','加载项目',loadProjects);else if(s.page>0&&s.page<6)await action('open-module','加载当前模块',async()=>{await ensureWorkspace(s.page);if(s.page===5)await loadHistory();if(s.page===3)await ensureEvaluator();});else render();return;}
     const el=e.target.closest?.('[data-action]');if(!el||el.disabled)return;e.preventDefault();if(actions[el.dataset.action])await action(el.dataset.action,el.textContent.trim(),()=>actions[el.dataset.action](el));
   });
+  document.addEventListener('toggle',e=>{
+    const target=e.target;if(!(target instanceof HTMLDetailsElement))return;
+    if(target.dataset.attemptSection)fillDetailSection(target);
+    if(target.dataset.detailRow){const entry=detailCache.get(target.dataset.detailRow);if(entry)entry.used=++detailClock;pruneDetailCache();}
+  },true);
+  document.addEventListener('focusout',e=>{if(e.target.closest?.('#run-pagination-region'))queueMicrotask(patchRunPagination);if(e.target.dataset.bind==='runChoice')queueMicrotask(patchRunPicker);if(e.target.dataset.bind==='projectChoice')queueMicrotask(patchProjectPicker);});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&s.cellViewer){closeCell();return;}if(e.key==='Escape'&&s.help){s.help=null;render();}});
   function closeCell(){const previous=s.cellViewer;s.cellViewer=null;render();if(previous)[...root.querySelectorAll('[data-view-cell]')].find(n=>n.dataset.cellRow===previous.rowId&&n.dataset.cellKey===previous.key&&n.dataset.viewCell===previous.kind)?.focus();}
   window.addEventListener('resize',()=>scrollResizers.forEach(sync=>sync()));
   window.addEventListener('beforeunload',e=>{if(dirty()||s.connectionDirty){e.preventDefault();e.returnValue='';}});
   render();
-  action('init','连接工作台',async()=>{await api('/health');s.online=true;setConnection(await api('/llm/profiles'));await loadProjects();const last=localStorage.getItem('eval.v1_1.project');if(last&&s.projects.some(p=>p.id===last))await switchProject(last);});
+  async function initialize(){
+    await action('init','连接工作台',async()=>{await api('/health');s.online=true;});
+    if(!s.online)return;
+    // Each loader paints its own region as soon as it settles; no shared final render.
+    loadProjects({restore:true}).catch(()=>{});
+    loadModelSettings().catch(()=>{});
+  }
+  initialize();
 })();

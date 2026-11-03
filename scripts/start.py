@@ -1,5 +1,6 @@
 """Run copied source with Python 3.10+; frontend files need no build step."""
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -25,6 +26,14 @@ def main():
     except ModuleNotFoundError:
         parser.error('Python dependencies are missing. Run: python -m pip install -r requirements.txt')
     sys.path.insert(0, str(repo_root))
+    # Enable only our identifier/timing logs, not HTTP client headers or request URLs.
+    for name in ('backend.store', 'backend.engine'):
+        logger = logging.getLogger(name)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(asctime)s %(name)s %(levelname)s %(message)s'))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
     print(f'Eval Studio v1.1: http://{args.host}:{args.port}', flush=True)
     uvicorn.run('backend.app:app', host=args.host, port=args.port, workers=1)
 

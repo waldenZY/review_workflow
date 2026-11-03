@@ -1,7 +1,8 @@
 import copy
 import io
 import os
-from contextlib import asynccontextmanager
+import sqlite3
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 
 import markdown
@@ -9,6 +10,7 @@ from fastapi import APIRouter, FastAPI, File, Form, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from jsonschema.exceptions import SchemaError
 from openpyxl import load_workbook
 
@@ -42,18 +44,24 @@ def create_app(data_dir=None, llm_config_path=None):
     @asynccontextmanager
     async def lifespan(app):
         app.state.store = Store(data_root)
-        app.state.settings = ModelSettings(llm_config_path or ROOT / 'config' / 'llm_config.local.json')
-        app.state.gateway = Gateway(app.state.settings)
-        app.state.history = History(app.state.store)
-        for project in app.state.store.projects(True):
-            for call in app.state.store.entities(project['id'], 'design_call', True):
-                if call['status'] == 'design_running':
-                    call.update(status='interrupted', finished_at=now(), error='服务重启，设计调用已中断。')
-                    app.state.store.save(project['id'], 'design_call', call, call['id'])
-        app.state.runner = Runner(app.state.store, app.state.gateway)
-        yield
-        app.state.runner.close()
-        app.state.store.close()
+        runner = None
+        try:
+            app.state.settings = ModelSettings(llm_config_path or ROOT / 'config' / 'llm_config.local.json')
+            app.state.gateway = Gateway(app.state.settings)
+            app.state.history = History(app.state.store)
+            for project in app.state.store.projects(True):
+                for call in app.state.store.entities(project['id'], 'design_call', True, summary=True):
+                    if call['status'] == 'design_running':
+                        call = app.state.store.get(project['id'], call['id'], kind='design_call')
+                        call.update(status='interrupted', finished_at=now(), error='服务重启，设计调用已中断。')
+                        app.state.store.save(project['id'], 'design_call', call, call['id'])
+            app.state.runner = Runner(app.state.store, app.state.gateway)
+            runner = app.state.runner
+            yield
+        finally:
+            if runner:
+                runner.close()
+            app.state.store.close()
 
     app = FastAPI(title='Eval Studio', version='1.1.0', lifespan=lifespan)
     router = APIRouter(prefix='/api/v1/projects/{project_id}')
@@ -77,6 +85,10 @@ def create_app(data_dir=None, llm_config_path=None):
     async def conflict(_, exc):
         return JSONResponse(status_code=409, content={'detail': clean(str(exc)), 'references': clean(exc.references)})
 
+    @app.exception_handler(sqlite3.Error)
+    async def database_error(_, exc):
+        return JSONResponse(status_code=503, content={'detail': '数据库暂时繁忙或存储操作失败，请稍后重试读取；不要重复提交模型任务。', 'code': 'storage_unavailable'})
+
     @app.exception_handler(OSError)
     async def file_error(_, exc):
         return JSONResponse(status_code=400, content={'detail': '文件操作失败，请检查数据目录权限、剩余空间和文件占用。'})
@@ -88,7 +100,7 @@ def create_app(data_dir=None, llm_config_path=None):
         return JSONResponse(status_code=422, content={'detail': clean(details)})
 
     @app.get('/api/v1/health')
-    def health():
+    async def health():
         return {'status': 'ok', 'version': '1.1.0', 'data_dir': str(data_root), 'database': 'workbench_v1_1.sqlite3'}
 
     @app.get('/api/v1/llm/status')
@@ -171,9 +183,9 @@ def create_app(data_dir=None, llm_config_path=None):
 
     @router.get('/catalog')
     def catalog(project_id: str):
-        return {'project': store().project(project_id), 'datasets': [dataset_meta(v) for v in store().entities(project_id, 'dataset')],
-                'mappings': store().entities(project_id, 'mapping'), 'specs': store().entities(project_id, 'spec'),
-                'evaluators': store().entities(project_id, 'evaluator'), 'runs': [run_meta(r) for r in store().runs(project_id)]}
+        return {'project': store().project(project_id), 'datasets': [dataset_meta(v) for v in store().entities(project_id, 'dataset', summary=True)],
+                'mappings': store().entities(project_id, 'mapping', summary=True), 'specs': store().entities(project_id, 'spec', summary=True),
+                'evaluators': store().entities(project_id, 'evaluator', summary=True), 'runs': [run_meta(r) for r in store().runs(project_id)]}
 
     @router.get('/entities/{object_id}')
     def get_entity(project_id: str, object_id: str, version: int | None = None):
@@ -226,38 +238,40 @@ def create_app(data_dir=None, llm_config_path=None):
         store().project(project_id, active=True)
         filename = Path((file.filename or 'upload').replace('\\', '/')).name
         content = await file.read(25 * 1024 * 1024 + 1)
-        try:
-            records, sources, sheet_name, source_hash = parse_file(filename, content, sheet, header_row)
-        except ValueError:
-            raise
-        except Exception:
-            raise ValueError('文件解析失败，请检查编码、格式及工作表。') from None
-        with store().lock:
-            store().writable(project_id)
-            folder = app.state.history.project_dir(project_id) / 'imports'
-            app.state.history.validate_path(folder, app.state.history.project_dir(project_id))
-            folder.mkdir(parents=True, exist_ok=True)
-            dataset_id = uid('dataset')
-            target = folder / (dataset_id + Path(filename).suffix.lower())
+        def ingest():
             try:
-                target.write_bytes(content)
-                value = {'filename': filename, 'sheet': sheet_name, 'header_row': header_row, 'source_hash': source_hash,
-                    'row_count': len(records), 'fields': fields_for(records),
-                    'rows': [{'row_id': f'{dataset_id}:{i}', 'source_row': n, 'original': row}
-                             for i, (row, n) in enumerate(zip(records, sources), 1)]}
-                result = store().save(project_id, 'dataset', value, new_id=dataset_id)
-                return dataset_meta(result)
-            except Exception:
-                if target.exists():
-                    target.unlink()
+                records, sources, sheet_name, source_hash = parse_file(filename, content, sheet, header_row)
+            except ValueError:
                 raise
+            except Exception:
+                raise ValueError('文件解析失败，请检查编码、格式及工作表。') from None
+            with store().lock:
+                store().writable(project_id)
+                folder = app.state.history.project_dir(project_id) / 'imports'
+                app.state.history.validate_path(folder, app.state.history.project_dir(project_id))
+                folder.mkdir(parents=True, exist_ok=True)
+                dataset_id = uid('dataset')
+                target = folder / (dataset_id + Path(filename).suffix.lower())
+                try:
+                    target.write_bytes(content)
+                    value = {'filename': filename, 'sheet': sheet_name, 'header_row': header_row, 'source_hash': source_hash,
+                        'row_count': len(records), 'fields': fields_for(records),
+                        'rows': [{'row_id': f'{dataset_id}:{i}', 'source_row': n, 'original': row}
+                                 for i, (row, n) in enumerate(zip(records, sources), 1)]}
+                    result = store().save(project_id, 'dataset', value, new_id=dataset_id)
+                    return dataset_meta(result)
+                except Exception:
+                    if target.exists():
+                        target.unlink()
+                    raise
+        return await run_in_threadpool(ingest)
 
     @router.get('/datasets/{dataset_id}/rows')
-    def rows(project_id: str, dataset_id: str, offset: int = 0, limit: int = 20):
-        dataset = store().get(project_id, dataset_id, kind='dataset')
+    def rows(project_id: str, dataset_id: str, offset: int = 0, limit: int = 20, version: int | None = None):
+        dataset = store().get(project_id, dataset_id, version=version, kind='dataset')
         if offset < 0 or limit not in (10, 20, 50):
             raise ValueError('offset 必须非负，limit 仅支持 10、20、50。')
-        return {'rows': dataset['rows'][offset:offset + limit], 'total': dataset['row_count']}
+        return {'rows': store().data_page(project_id, dataset['material_id'], offset, limit), 'total': dataset['row_count']}
 
     @router.post('/mappings')
     def save_mapping(project_id: str, body: MappingSave):
@@ -327,11 +341,11 @@ def create_app(data_dir=None, llm_config_path=None):
 
     @router.post('/evidence/analyze')
     def analyze(project_id: str, body: AnalysisRequest):
-        with store().lock:
+        with nullcontext():
             mapping = store().get(project_id, body.mapping_id, body.mapping_version, 'mapping', True)
             dataset = store().get(project_id, mapping['dataset_id'], kind='dataset', active=True)
             spec = store().get(project_id, body.spec_id, body.spec_version, 'spec', True)
-            row = next((r for r in dataset['rows'] if r['row_id'] == body.row_id), None)
+            row = store().data_row(project_id, dataset['material_id'], body.row_id)
             if not row:
                 raise ValueError('样本不属于当前数据集。')
             checks = [{'path': p, 'missing': at(row['original'], p) is MISSING, 'empty': at(row['original'], p, None) in (None, '', [], {})} for p in mapping['evaluation_fields']]
@@ -365,15 +379,15 @@ def create_app(data_dir=None, llm_config_path=None):
 
     @router.get('/evaluators/matching')
     def matching_evaluators(project_id: str, spec_id: str, spec_version: int):
-        with store().lock:
+        with nullcontext():
             store().get(project_id, spec_id, spec_version, 'spec', True)
-            values = store().entities(project_id, 'evaluator', all_versions=True)
+            values = store().entities(project_id, 'evaluator', all_versions=True, summary=True)
             keys = ('id', 'version', 'title', 'created_at', 'spec_id', 'spec_version')
             return {'items': [{k: v[k] for k in keys} for v in values if v['spec_id'] == spec_id and v['spec_version'] == spec_version]}
 
     @router.post('/evaluators/build')
     def build(project_id: str, body: EvaluatorBuildRequest):
-        with store().lock:
+        with nullcontext():
             spec = store().get(project_id, body.spec_id, body.spec_version, 'spec', True)
             if body.source is None:
                 return rebuild_evaluator(spec)
@@ -426,9 +440,9 @@ def create_app(data_dir=None, llm_config_path=None):
     @router.post('/requests/preview')
     def preview(project_id: str, body: PreviewRequest):
         # Archived history has its own read-only trace; new previews use active saved objects.
-        with store().lock:
+        with nullcontext():
             snapshot = context(project_id, body)
-            row = next((r for r in snapshot['dataset']['rows'] if r['row_id'] == body.row_id), None)
+            row = store().data_row(project_id, snapshot['dataset']['material_id'], body.row_id)
             if not row:
                 raise ValueError('样本不属于当前数据集。')
             connection = app.state.settings.current
@@ -439,7 +453,7 @@ def create_app(data_dir=None, llm_config_path=None):
 
     @router.post('/requests/preview-draft')
     def preview_draft(project_id: str, body: DraftPreviewRequest):
-        with store().lock:
+        with nullcontext():
             store().project(project_id, active=True)
             dataset = store().get(project_id, body.dataset_id, kind='dataset', active=True)
             # Bind the draft to a real project-owned spec; identity and version are not editable in drafts.
@@ -458,7 +472,7 @@ def create_app(data_dir=None, llm_config_path=None):
             for criterion in spec['criteria']:
                 if criterion['enabled'] and criterion['method'] != 'llm' and criterion['target_field'] not in body.evaluation_fields:
                     raise ValueError('程序规则的作用字段必须属于当前评测字段。')
-            row = next((r for r in dataset['rows'] if r['row_id'] == body.row_id), None)
+            row = store().data_row(project_id, dataset['material_id'], body.row_id)
             if row is None:
                 raise ValueError('样本不属于当前数据集。')
             evaluator, example = validate_evaluator(spec, body.evaluator)
@@ -467,170 +481,162 @@ def create_app(data_dir=None, llm_config_path=None):
                     'example': example, 'draft': True, 'notice': '草稿预览：不保存版本、不发送模型请求；执行仍使用已保存版本。'}
 
     def enqueue(project_id, snapshot, selected, parent_run_id=None):
-        # Caller holds store.lock: reference validation, frozen connection, and insertion are atomic.
-        has_llm = any(c['enabled'] and c['method'] == 'llm' for c in snapshot['spec']['criteria'])
+        if app.state.runner.stop.is_set():
+            raise Conflict('执行队列已停止，请检查日志并在维护后重新启动。')
+        has_llm = any(c['enabled'] and c['method']=='llm' for c in snapshot['spec']['criteria'])
         connection = app.state.settings.capture() if has_llm else None
         snapshot = copy.deepcopy(snapshot)
         snapshot['model_config'] = connection.public() if connection else {}
         snapshot['execution_config'] = {'batch_concurrency': connection.batch_concurrency if connection else 1}
-        run = {'id': uid('run'), 'project_id': project_id, 'title': snapshot['spec']['title'] + ' · ' + now(),
-               'created_at': now(), 'started_at': None, 'finished_at': None, 'status': 'queued', 'error': None,
-               'cancel_requested': False, 'snapshot': snapshot, 'parent_run_id': parent_run_id,
-               'records': [{'row_id': i, 'status': 'pending', 'attempts': []} for i in selected]}
+        run = {'id': uid('run'), 'project_id': project_id, 'title': snapshot['spec']['title']+' · '+now(),
+               'created_at':now(), 'started_at':None, 'finished_at':None, 'status':'queued', 'error':None,
+               'cancel_requested':False, 'snapshot':snapshot, 'parent_run_id':parent_run_id}
+        run = store().create_run(run, selected)
         app.state.runner.submit(run, connection)
         store().event(project_id, run['id'], 'run_created')
         return run_meta(run)
 
-    def select_rows(snapshot, row_ids):
-        available = [r['row_id'] for r in snapshot['dataset']['rows']]
-        if not row_ids or len(row_ids) != len(set(row_ids)) or any(i not in available for i in row_ids):
-            raise ValueError('请明确选择当前数据集有效且不重复的样本。')
-        return [i for i in available if i in set(row_ids)]
+    def select_rows(project_id, snapshot, row_ids, parent_run_id=None):
+        store().validate_rows(project_id, snapshot['dataset']['material_id'], row_ids, parent_run_id)
+        return row_ids
 
     @router.post('/runs')
     def create_run(project_id: str, body: RunRequest):
         with store().lock:
             snapshot = context(project_id, body)
-            if body.selection_mode == 'all':
+            if body.selection_mode=='all':
                 if body.row_ids:
                     raise ValueError('全量运行不能同时指定样本。')
-                selected = [r['row_id'] for r in snapshot['dataset']['rows']]
+                selected = None
             else:
-                selected = select_rows(snapshot, body.row_ids)
+                selected = select_rows(project_id, snapshot, body.row_ids)
             return enqueue(project_id, snapshot, selected)
+
+    def run_status(run, stages=None):
+        if stages is None:
+            # Mutation endpoints also return a fresh, independently observed progress snapshot.
+            run, stages = app.state.runner.observe(run['project_id'], run['id'], summary=True)
+        return {**run_meta(run), 'error':run.get('error'), 'finished_at':run.get('finished_at'),
+                'retryable':run['progress']['succeeded']<run['progress']['selected'],
+                'round_progress':run['round_progress'], 'current_round':run['current_round'],
+                'updated_at':run['updated_at'], 'stage_counts':stages}
 
     @router.get('/runs/{run_id}')
     def get_run(project_id: str, run_id: str):
-        run = store().get_run(project_id, run_id)
+        run, stages = app.state.runner.observe(project_id, run_id)
         snap = run['snapshot']
-        return {**run_status(run), 'snapshot': {
-            'project': snap['project'], 'dataset': dataset_meta(snap['dataset']),
-            'mapping': {k: snap['mapping'][k] for k in ('id', 'version', 'evaluation_fields')},
-            'spec': {k: snap['spec'][k] for k in ('id', 'version', 'title')},
-            'evaluator': {k: snap['evaluator'][k] for k in ('id', 'version', 'spec_id', 'spec_version')},
-            'model_config': snap['model_config'], 'execution_config': snap.get('execution_config', {'batch_concurrency': 1})},
-            'original_columns': list(dict.fromkeys(k for row in snap['dataset']['rows'] for k in row['original'])),
-            'exports': store().exports(project_id, run_id)}
-
-    def run_status(run):
-        return {**run_meta(run), 'error': run.get('error'), 'finished_at': run.get('finished_at'),
-                'retryable': any(r['status'] != 'completed' for r in run['records'])}
+        return {**run_status(run, stages), 'snapshot':{
+            'project':snap['project'], 'dataset':dataset_meta(snap['dataset']),
+            'mapping':{k:snap['mapping'][k] for k in ('id','version','evaluation_fields')},
+            'spec':{k:snap['spec'][k] for k in ('id','version','title')},
+            'evaluator':{k:snap['evaluator'][k] for k in ('id','version','spec_id','spec_version')},
+            'model_config':snap['model_config'], 'execution_config':snap.get('execution_config',{'batch_concurrency':1})},
+            'original_columns':snap['dataset']['original_columns'], 'exports':store().exports(project_id,run_id)}
 
     @router.get('/runs/{run_id}/progress')
     def run_progress(project_id: str, run_id: str):
-        return run_status(store().get_run(project_id, run_id))
+        run, stages = app.state.runner.observe(project_id, run_id, summary=True)
+        return run_status(run, stages)
+
+    @router.get('/runs/{run_id}/rounds')
+    def run_rounds(project_id: str, run_id: str):
+        return {'rounds':store().rounds(project_id,run_id)}
 
     @router.get('/runs/{run_id}/records')
-    def run_records(project_id: str, run_id: str, offset: int = 0, limit: int = 20):
-        if offset < 0 or limit not in (10, 20, 50):
+    def run_records(project_id: str, run_id: str, offset: int=0, limit: int=20, status_group: str='all', error_stage: str=''):
+        if offset<0 or limit not in (10,20,50):
             raise ValueError('offset 必须非负，limit 仅支持 10、20、50。')
-        run = store().get_run(project_id, run_id)
-        sources = {r['row_id']: r['source_row'] for r in run['snapshot']['dataset']['rows']}
-        records = []
-        for record in run['records'][offset:offset + limit]:
-            attempt = record['attempts'][-1] if record['attempts'] else {}
-            records.append({'row_id': record['row_id'], 'source_row': sources[record['row_id']], 'status': record['status'],
-                            'attempt_count': len(record['attempts']), 'latest_attempt_id': attempt.get('id'),
-                            'criteria': attempt.get('criteria', []), 'error': attempt.get('error')})
-        return {'records': records, 'total': len(run['records']), 'offset': offset, 'limit': limit}
+        if error_stage and (status_group!='errors' or error_stage not in ('call_failed','parse_failed','schema_failed','projection_failed','scheduler_failed')):
+            raise ValueError('错误阶段筛选仅用于执行异常。')
+        return store().record_page(project_id,run_id,offset,limit,status_group,error_stage)
 
     @router.get('/runs/{run_id}/records/{row_id}')
     def run_record(project_id: str, run_id: str, row_id: str):
-        run = store().get_run(project_id, run_id)
-        record = next((r for r in run['records'] if r['row_id'] == row_id), None)
-        if record is None:
-            raise KeyError('记录不属于本次运行。')
-        row = next(r for r in run['snapshot']['dataset']['rows'] if r['row_id'] == row_id)
-        return {**record, 'source_row': row['source_row'], 'original': row['original']}
+        return store().record_detail(project_id,run_id,row_id)
 
     @router.get('/runs/{run_id}/configuration')
     def run_configuration(project_id: str, run_id: str):
-        run = store().get_run(project_id, run_id)
-        return {'snapshot': {**run['snapshot'], 'dataset': dataset_meta(run['snapshot']['dataset'])},
-                'row_ids': [r['row_id'] for r in run['records']]}
+        run = store().get_run(project_id,run_id)
+        return {'snapshot':run['snapshot'], 'row_ids':store().row_ids(project_id,run_id)}
 
     @router.post('/runs/{run_id}/cancel')
     def cancel(project_id: str, run_id: str):
-        with store().lock:
-            run = store().get_run(project_id, run_id, True)
-            if run['status'] not in BUSY:
-                raise ValueError('任务已结束。')
-            run.update(cancel_requested=True, status='cancelling')
-            store().put_run(run)
-            return run_meta(run)
+        return run_status(store().cancel_run(project_id,run_id))
 
     @router.post('/runs/{run_id}/retry')
     def retry(project_id: str, run_id: str):
         with store().lock:
-            run = store().get_run(project_id, run_id, True)
+            if app.state.runner.stop.is_set():
+                raise Conflict('执行队列已停止，暂时不能重试。')
+            run = store().get_run(project_id,run_id,True)
             if run['status'] in BUSY:
                 raise Conflict('任务仍在运行。')
-            for kind in ('dataset', 'mapping', 'spec', 'evaluator'):
-                v = run['snapshot'][kind]
-                store().get(project_id, v['id'], v['version'], kind, True)
+            for kind in ('dataset','mapping','spec','evaluator'):
+                v=run['snapshot'][kind]
+                store().get(project_id,v['id'],v['version'],kind,True)
             try:
-                connection = app.state.settings.capture(run['snapshot']['model_config']['profile_id']) if run['snapshot']['model_config'] else None
+                connection=app.state.settings.capture(run['snapshot']['model_config']['profile_id']) if run['snapshot']['model_config'] else None
             except ValueError as exc:
-                raise Conflict('不能原配置重试：' + str(exc)) from None
-            if connection and connection.public()['fingerprint'] != run['snapshot']['model_config']['fingerprint']:
-                raise Conflict('运行绑定的模型配置公开参数已变化，请新建复测。仅轮换密钥不影响原配置重试。')
-            if not any(r['status'] != 'completed' for r in run['records']):
-                raise ValueError('没有需要重试的记录。')
-            for record in run['records']:
-                if record['status'] != 'completed':
-                    record['status'] = 'pending'
-            run.update(status='queued', cancel_requested=False, error=None, finished_at=None)
-            app.state.runner.submit(run, connection)
-            store().event(project_id, run_id, 'retried')
-            return run_meta(run)
+                raise Conflict('不能原配置重试：'+str(exc)) from None
+            if connection and connection.public()['fingerprint']!=run['snapshot']['model_config']['fingerprint']:
+                raise Conflict('运行绑定的公开模型参数已变化，请恢复参数或新建复测。仅换密钥不影响重试。')
+            run=store().retry_run(project_id,run_id)
+            app.state.runner.submit(run,connection)
+            store().event(project_id,run_id,'retried',{'round':run['current_round']})
+            return run_status(run)
 
     @router.post('/runs/{run_id}/rerun')
     def rerun(project_id: str, run_id: str, body: RerunRequest):
         with store().lock:
-            original = store().get_run(project_id, run_id, True)
+            original=store().get_run(project_id,run_id,True)
             if original['status'] in BUSY:
                 raise Conflict('请等待原运行结束。')
-            snapshot = context(project_id, body)
-            if snapshot['dataset']['id'] != original['snapshot']['dataset']['id']:
+            snapshot=context(project_id,body)
+            if snapshot['dataset']['id']!=original['snapshot']['dataset']['id']:
                 raise ValueError('复测必须使用原数据集。')
-            selected = select_rows(snapshot, body.row_ids)
-            if any(i not in {r['row_id'] for r in original['records']} for i in selected):
-                raise ValueError('选中样本必须属于原运行。其他样本请新建普通任务。')
-            return enqueue(project_id, snapshot, selected, run_id)
+            selected=select_rows(project_id,snapshot,body.row_ids,run_id)
+            return enqueue(project_id,snapshot,selected,run_id)
 
     @router.post('/runs/{run_id}/export')
     def export(project_id: str, run_id: str, body: ExportRequest):
-        with store().lock:
-            run = store().get_run(project_id, run_id)
-            if run['status'] in BUSY:
-                raise Conflict('请在任务结束后导出。')
-            columns, records = export_records(run, body.original_fields, body.include_raw_response)
-            folder = app.state.history.project_dir(project_id) / 'runs' / run_id
-            app.state.history.validate_path(folder, app.state.history.project_dir(project_id))
-            folder.mkdir(parents=True, exist_ok=True)
-            target = folder / (uid('export') + '.' + body.format)
+        # A lightweight lease prevents retry/deletion, without locking database reads or writes.
+        with store().export_lease(project_id,run_id) as run:
+            columns,records=export_records(store(),run,body.original_fields,body.include_raw_response)
+            folder=app.state.history.project_dir(project_id)/'runs'/run_id
+            app.state.history.validate_path(folder,app.state.history.project_dir(project_id))
+            folder.mkdir(parents=True,exist_ok=True)
+            target=folder/(uid('export')+'.'+body.format)
+            manifest=target.with_suffix('.manifest.json')
+            count=0
             try:
-                if body.format == 'jsonl':
-                    with target.open('w', encoding='utf-8', newline='\n') as stream:
+                if body.format=='jsonl':
+                    with target.open('w',encoding='utf-8',newline='\n') as stream:
                         for row in records:
-                            stream.write(dumps(row) + '\n')
+                            stream.write(dumps(row)+'\n')
+                            count+=1
                 else:
-                    eval_columns = list(records[0]['evaluation'])
-                    extras = ['eval.' + c for c in eval_columns]
-                    if set(columns) & set(extras):
-                        raise ValueError('原始列与 eval.* 导出列冲突，请使用 JSONL 或调整原始列名。')
-                    write_xlsx(target, [[*[r['original'][c] for c in columns], *[r['evaluation'][c] for c in eval_columns]] for r in records], columns + extras)
-                metadata = {'format': body.format, 'file': target.name, 'original_fields': columns, 'include_raw_response': body.include_raw_response,
-                            'model_config': run['snapshot']['model_config'],
-                            'execution_config': run['snapshot'].get('execution_config', {'batch_concurrency': 1}), 'rows': len(records)}
-                target.with_suffix('.manifest.json').write_text(dumps(metadata), encoding='utf-8')
-                store().register_export(project_id, run_id, metadata)
+                    first=next(records)
+                    extras=['eval.'+c for c in first['evaluation']]
+                    if set(columns)&set(extras):
+                        raise ValueError('原始列与 eval.* 列冲突，请使用 JSONL 或调整原始列名。')
+                    from itertools import chain
+                    def excel_rows():
+                        nonlocal count
+                        for r in chain((first,),records):
+                            count+=1
+                            yield [*[r['original'][c] for c in columns],*r['evaluation'].values()]
+                    write_xlsx(target,excel_rows(),columns+extras)
+                metadata={'format':body.format,'file':target.name,'original_fields':columns,
+                    'include_raw_response':body.include_raw_response,'model_config':run['snapshot']['model_config'],
+                    'execution_config':run['snapshot'].get('execution_config',{'batch_concurrency':1}),'rows':count}
+                manifest.write_text(dumps(metadata),encoding='utf-8')
+                store().register_export(project_id,run_id,metadata)
             except Exception:
                 target.unlink(missing_ok=True)
-                target.with_suffix('.manifest.json').unlink(missing_ok=True)
+                manifest.unlink(missing_ok=True)
                 raise
-            media = 'application/x-ndjson' if body.format == 'jsonl' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            return FileResponse(target, filename=f'{run_id}.{body.format}', media_type=media)
+            media='application/x-ndjson' if body.format=='jsonl' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            return FileResponse(target,filename=f'{run_id}.{body.format}',media_type=media)
 
     @router.get('/history')
     def history(project_id: str, kind: str | None = None, include_archived: bool = False):
@@ -644,7 +650,7 @@ def create_app(data_dir=None, llm_config_path=None):
     def history_detail(project_id: str, kind: str, object_id: str):
         value = app.state.history.get(project_id, kind, object_id)
         if kind == 'dataset':
-            value = dataset_meta(value) | {'preview_rows': value['rows'][:20]}
+            value = dataset_meta(value) | {'preview_rows': store().data_page(project_id, value['material_id'], 0, 20)}
         elif kind == 'run':
             value = get_run(project_id, object_id)
         versions = [] if kind == 'run' else store().versions(project_id, object_id)

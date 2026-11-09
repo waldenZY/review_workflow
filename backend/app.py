@@ -20,7 +20,7 @@ from .engine import (Runner, check_schema, export_records, messages_for,
                      rebuild_evaluator, validate_output_contract, validate_templates)
 from .history import History
 from .llm import Gateway, GatewayError, ModelSettings, decode_output, parse_output
-from .models import (AnalysisRequest, ConnectionTest, Criterion, DraftPreviewRequest, EvaluatorBuildRequest, EvaluatorSave,
+from .models import (AnalysisRequest, CloneRunRequest, ConnectionTest, Criterion, DraftPreviewRequest, EvaluatorBuildRequest, EvaluatorSave,
                      ExportRequest, ExtractRequest, MappingSave, ObjectDelete, PreviewRequest,
                      ProfileSave, ProjectDelete, ProjectSave, RerunRequest, RunRequest, SpecSave)
 from .store import BUSY, Conflict, Store, dumps, now, uid
@@ -391,14 +391,24 @@ def create_app(data_dir=None, llm_config_path=None):
             spec = store().get(project_id, body.spec_id, body.spec_version, 'spec', True)
             if body.source is None:
                 return rebuild_evaluator(spec)
-            if body.source.spec_id != spec['id']:
+            if body.source.spec_id != spec['id'] and not body.allow_rebind:
                 raise ValueError('自动同步只接受同一标准方案的来源草稿。')
-            old_spec = store().get(project_id, body.source.spec_id, body.source.spec_version, 'spec', True)
+            old_spec = store().get(project_id, body.source.spec_id, body.source.spec_version, 'spec', not body.allow_rebind)
             if body.source.id:
-                old_evaluator = store().get(project_id, body.source.id, kind='evaluator', active=True)
-                if old_evaluator['spec_id'] != spec['id']:
+                old_evaluator = store().get(project_id, body.source.id, kind='evaluator', active=not body.allow_rebind)
+                if old_evaluator['spec_id'] != body.source.spec_id:
                     raise ValueError('来源评测器不属于该标准方案。')
-            return rebuild_evaluator(spec, old_spec, body.source.model_dump())
+            value = rebuild_evaluator(spec, old_spec, body.source.model_dump())
+            if body.allow_rebind:
+                value.pop('id', None)
+                value['title'] += ' 副本'
+                old_names = {c['id']: c['name'] for c in old_spec['criteria']}
+                new_ids = {c['name']: c['id'] for c in spec['criteria']}
+                for item in value['projection']:
+                    name = old_names.get(item['criterion_id'])
+                    if name in new_ids:
+                        item['criterion_id'] = new_ids[name]
+            return value
 
     @router.post('/evaluators')
     def save_evaluator(project_id: str, body: EvaluatorSave):
@@ -480,14 +490,15 @@ def create_app(data_dir=None, llm_config_path=None):
             return {'messages': messages, 'request': app.state.gateway.preview(messages, app.state.settings.current),
                     'example': example, 'draft': True, 'notice': '草稿预览：不保存版本、不发送模型请求；执行仍使用已保存版本。'}
 
-    def enqueue(project_id, snapshot, selected, parent_run_id=None):
+    def enqueue(project_id, snapshot, selected, parent_run_id=None, original_connection=None, preserve_config=False):
         if app.state.runner.stop.is_set():
             raise Conflict('执行队列已停止，请检查日志并在维护后重新启动。')
         has_llm = any(c['enabled'] and c['method']=='llm' for c in snapshot['spec']['criteria'])
-        connection = app.state.settings.capture() if has_llm else None
+        connection = original_connection if preserve_config else app.state.settings.capture() if has_llm else None
         snapshot = copy.deepcopy(snapshot)
-        snapshot['model_config'] = connection.public() if connection else {}
-        snapshot['execution_config'] = {'batch_concurrency': connection.batch_concurrency if connection else 1}
+        if not preserve_config:
+            snapshot['model_config'] = connection.public() if connection else {}
+            snapshot['execution_config'] = {'batch_concurrency': connection.batch_concurrency if connection else 1}
         run = {'id': uid('run'), 'project_id': project_id, 'title': snapshot['spec']['title']+' · '+now(),
                'created_at':now(), 'started_at':None, 'finished_at':None, 'status':'queued', 'error':None,
                'cancel_requested':False, 'snapshot':snapshot, 'parent_run_id':parent_run_id}
@@ -520,6 +531,27 @@ def create_app(data_dir=None, llm_config_path=None):
                 'retryable':run['progress']['succeeded']<run['progress']['selected'],
                 'round_progress':run['round_progress'], 'current_round':run['current_round'],
                 'updated_at':run['updated_at'], 'stage_counts':stages}
+
+    @router.get('/run-history')
+    def run_history(project_id: str, offset: int = 0, limit: int = 20, status: str = '', dataset_id: str = '', include_archived: bool = False):
+        if offset < 0 or limit not in (10, 20, 50):
+            raise ValueError('无效分页参数。')
+        store().project(project_id)
+        clauses, args = ['r.project_id=?'], [project_id]
+        if not include_archived:
+            clauses.append('l.archived_at IS NULL')
+        if status:
+            clauses.append('r.status=?')
+            args.append(status)
+        if dataset_id:
+            clauses.append("EXISTS (SELECT 1 FROM object_refs o WHERE o.project_id=r.project_id AND o.owner_id=r.id AND o.target_kind='dataset' AND o.target_id=?)")
+            args.append(dataset_id)
+        source = ' FROM runs r LEFT JOIN lifecycle l ON l.project_id=r.project_id AND l.id=r.id WHERE ' + ' AND '.join(clauses)
+        with store().read() as db:
+            total = db.execute('SELECT COUNT(*)' + source, args).fetchone()[0]
+            ids = [r[0] for r in db.execute('SELECT r.id' + source + ' ORDER BY r.rowid DESC LIMIT ? OFFSET ?', (*args, limit, offset))]
+        values = [store().get_run(project_id, i, summary=True) for i in ids]
+        return {'items': [run_meta(v) | {k: v.get(k) for k in ('started_at', 'finished_at')} for v in values], 'total': total}
 
     @router.get('/runs/{run_id}')
     def get_run(project_id: str, run_id: str):
@@ -555,9 +587,27 @@ def create_app(data_dir=None, llm_config_path=None):
         return store().record_detail(project_id,run_id,row_id)
 
     @router.get('/runs/{run_id}/configuration')
-    def run_configuration(project_id: str, run_id: str):
+    def run_configuration(project_id: str, run_id: str, include_rows: bool = True):
         run = store().get_run(project_id,run_id)
-        return {'snapshot':run['snapshot'], 'row_ids':store().row_ids(project_id,run_id)}
+        return {'snapshot':run['snapshot'], **({'row_ids':store().row_ids(project_id,run_id)} if include_rows else {})}
+
+    @router.post('/runs/{run_id}/clone')
+    def clone_run(project_id: str, run_id: str, body: CloneRunRequest | None = None):
+        with store().lock:
+            run = store().get_run(project_id, run_id)
+            store().writable(project_id)
+            if run['status'] in BUSY:
+                raise Conflict('请等待原运行结束。')
+            for kind in ('dataset', 'mapping', 'spec', 'evaluator'):
+                obj = run['snapshot'][kind]
+                store().get(project_id, obj['id'], obj['version'], kind, True)
+            config = run['snapshot']['model_config']
+            connection = app.state.settings.capture(config['profile_id']) if config else None
+            if connection and connection.public()['fingerprint'] != config['fingerprint']:
+                raise Conflict('原模型参数已变化，请恢复参数或载入配置并编辑。仅换密钥不影响重跑。')
+            selected = body.row_ids if body and body.row_ids is not None else store().row_ids(project_id, run_id)
+            return enqueue(project_id, run['snapshot'], selected, run_id,
+                           original_connection=connection, preserve_config=True)
 
     @router.post('/runs/{run_id}/cancel')
     def cancel(project_id: str, run_id: str):

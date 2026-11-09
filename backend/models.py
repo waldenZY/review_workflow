@@ -24,8 +24,13 @@ class ObjectDelete(Input):
     confirm_id: str
 
 
+class CloneRunRequest(Input):
+    row_ids: list[str] | None = Field(default=None, min_length=1)
+
+
 class MappingSave(Input):
     id: str | None = None
+    title: str = Field(default='字段方案', min_length=1, max_length=120)
     dataset_id: str
     evaluation_fields: list[str] = Field(min_length=1)
 
@@ -85,6 +90,7 @@ class EvaluatorSave(BuildRequest):
 
 class EvaluatorBuildRequest(BuildRequest):
     source: EvaluatorSave | None = None
+    allow_rebind: bool = False
 
 
 class ContextRequest(Input):

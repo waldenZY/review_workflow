@@ -1206,3 +1206,21 @@ tr:last-child td {
 .result-table .cell-value span {display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .attempt-card {padding:9px;border:1px solid var(--border);border-radius:6px;margin:9px 0}
 .attempt-card p {font-size:12px}
+.workspace-modal-open {overflow:hidden}
+.workspace-overlay {position:fixed;inset:0;z-index:70;background:rgba(14,22,38,.55);backdrop-filter:blur(5px);display:flex;align-items:center;justify-content:center;padding:28px}
+.workspace-dialog {width:min(1260px,94vw);height:min(860px,90dvh);max-height:94dvh;display:flex;flex-direction:column;background:var(--surface,#fff);border:1px solid var(--border);border-radius:14px;box-shadow:0 24px 90px #0004;overflow:hidden}
+.workspace-dialog-heading {display:flex;align-items:center;justify-content:space-between;padding:14px 22px;border-bottom:1px solid var(--border);gap:16px}
+.workspace-dialog-heading h2 {font-size:18px;margin:0}
+.workspace-dialog-body {padding:16px 22px;overflow:auto;overscroll-behavior:contain;min-height:0;font-size:13px}
+.workspace-dialog-body .toolbar {margin:10px 0;flex-wrap:wrap}
+.workspace-dialog-body th,.workspace-dialog-body td {padding:8px 10px;vertical-align:top}
+.workspace-dialog-actions {display:flex;flex-wrap:wrap;gap:8px;padding:14px 0;border-top:1px solid var(--border);margin-top:18px}
+.workspace-dialog-body .context-grid {margin:12px 0}
+.history-results {min-width:850px}
+.history-results td {min-width:95px;max-width:310px;overflow-wrap:anywhere}
+.history-results .advanced summary {max-width:230px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.history-results pre {min-width:190px;max-height:300px}
+.history-record {margin:16px 0;padding:14px;border:1px solid var(--border);border-radius:8px}
+.history-criterion {border-bottom:1px solid var(--border);padding:8px 0}
+.preserve-lines {white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:640px){.workspace-overlay{padding:8px}.workspace-dialog{width:100%;height:94dvh}.workspace-dialog-body{padding:12px}.workspace-dialog-heading{padding:12px}.workspace-dialog-body .context-grid{grid-template-columns:1fr 1fr}}

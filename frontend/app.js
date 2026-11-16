@@ -2,6 +2,7 @@
 (() => {
   'use strict';
   const root = document.getElementById('root');
+  const MAX_IMPORT_BYTES = 100 * 1024 * 1024;
   const pretty = v => JSON.stringify(v, null, 2);
   const clone = v => JSON.parse(JSON.stringify(v));
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -310,6 +311,7 @@
   function exampleMarkup(){return s.example?(s.example.value!==null?json(s.example.value):`<p class="muted">${esc(s.example.message)}</p>`):'<p class="muted">构建或预览后生成结构示例；不是评测结论。</p>';}
   async function chooseFile(file){
     if(!file)return;if(!/\.(jsonl|json|xlsx)$/i.test(file.name))throw new Error('仅支持 JSONL、JSON、XLSX，不支持 CSV。');
+    if(file.size>MAX_IMPORT_BYTES)throw new Error('单文件最大 100 MB。');
     s.file=file;s.sheets=[];s.sheet='';s.headerRow=1;
     if(/\.xlsx$/i.test(file.name)){const form=new FormData();form.append('file',file);s.sheets=(await papi('/datasets/inspect','POST',form)).sheets;s.sheet=s.sheets[0];}
   }
@@ -357,7 +359,7 @@
     replaceSmallHTML(document.getElementById('execution-context'),s.project?executionContextHTML():'');syncControls();
   }
   function dataPage(){
-    let result=panel('导入已有数据','JSONL / JSON / XLSX，最大 25 MB；不生成待评测内容。',`<div class="toolbar"><label class="button">选择文件<input type="file" data-file="dataset" accept=".jsonl,.json,.xlsx" hidden ${readonly()?'disabled':''}></label><span class="muted">${esc(s.file?.name||'尚未选择文件')}</span></div>${s.file?`<div class="toolbar">${s.sheets?.length?inlineField('工作表',select('sheet',s.sheets.map(v=>[v,v]),s.sheet))+inlineField('表头行',input('headerRow',s.headerRow,'number','min="1"')):''}${button('import','导入到当前项目','primary',readonly())}</div>`:''}`);
+    let result=panel('导入已有数据','JSONL / JSON / XLSX，最大 100 MB；不生成待评测内容。',`<div class="toolbar"><label class="button">选择文件<input type="file" data-file="dataset" accept=".jsonl,.json,.xlsx" hidden ${readonly()?'disabled':''}></label><span class="muted">${esc(s.file?.name||'尚未选择文件')}</span></div>${s.file?`<div class="toolbar">${s.sheets?.length?inlineField('工作表',select('sheet',s.sheets.map(v=>[v,v]),s.sheet))+inlineField('表头行',input('headerRow',s.headerRow,'number','min="1"')):''}${button('import','导入到当前项目','primary',readonly())}</div>`:''}`);
     result+=panel('项目数据集','选择数据集，再选择它所属的字段方案。',`<div class="toolbar">${select('datasetChoice',[['','选择数据集'],...s.catalog.datasets.map(d=>[d.id,d.filename])],s.dataset?.id||'')}${manageButton('dataset')}</div>`);
     if(!s.dataset)return result+empty('导入后可以选择共同使用的评测字段。需要说明时点击右上角“使用帮助”。');
     const keys=[...new Set(s.rows.flatMap(r=>Object.keys(r.original)))];

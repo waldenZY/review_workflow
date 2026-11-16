@@ -9,6 +9,12 @@ from openpyxl.cell import WriteOnlyCell
 
 
 MISSING = object()
+MAX_IMPORT_BYTES = 100 * 1024 * 1024
+
+
+def check_import_size(content):
+    if len(content) > MAX_IMPORT_BYTES:
+        raise ValueError('单文件最大 100 MB。')
 
 
 def pointer_escape(value):
@@ -54,8 +60,7 @@ def parse_file(filename, content, sheet=None, header_row=1):
     suffix = Path(filename).suffix.lower()
     if suffix not in ('.jsonl', '.json', '.xlsx'):
         raise ValueError('仅支持 JSONL、JSON、XLSX，不支持 CSV。')
-    if len(content) > 25 * 1024 * 1024:
-        raise ValueError('单文件最大 25 MB。')
+    check_import_size(content)
     sources = []
     sheet_name = None
     if suffix in ('.json', '.jsonl'):

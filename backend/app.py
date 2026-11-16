@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from jsonschema.exceptions import SchemaError
 from openpyxl import load_workbook
 
-from .data_io import MISSING, at, fields_for, parse_file, write_xlsx
+from .data_io import MAX_IMPORT_BYTES, MISSING, at, check_import_size, fields_for, parse_file, write_xlsx
 from .engine import (Runner, check_schema, export_records, messages_for,
                      output_example, progress, project_criteria, shared_fields,
                      rebuild_evaluator, validate_output_contract, validate_templates)
@@ -221,9 +221,8 @@ def create_app(data_dir=None, llm_config_path=None):
         store().project(project_id, active=True)
         if Path(file.filename or '').suffix.lower() != '.xlsx':
             raise ValueError('工作表检查仅接受 XLSX。')
-        content = await file.read(25 * 1024 * 1024 + 1)
-        if len(content) > 25 * 1024 * 1024:
-            raise ValueError('文件超过 25 MB。')
+        content = await file.read(MAX_IMPORT_BYTES + 1)
+        check_import_size(content)
         try:
             book = load_workbook(io.BytesIO(content), read_only=True)
             try:
@@ -237,7 +236,8 @@ def create_app(data_dir=None, llm_config_path=None):
     async def import_dataset(project_id: str, file: UploadFile = File(...), sheet: str = Form(''), header_row: int = Form(1)):
         store().project(project_id, active=True)
         filename = Path((file.filename or 'upload').replace('\\', '/')).name
-        content = await file.read(25 * 1024 * 1024 + 1)
+        content = await file.read(MAX_IMPORT_BYTES + 1)
+        check_import_size(content)
         def ingest():
             try:
                 records, sources, sheet_name, source_hash = parse_file(filename, content, sheet, header_row)

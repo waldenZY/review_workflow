@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import io
 import os
 import sqlite3
@@ -27,6 +28,11 @@ from .store import BUSY, Conflict, Store, dumps, now, uid
 from .output_templates import compile_spec, compile_template
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def asset_url(name):
+    digest = hashlib.sha256((ROOT / 'frontend' / name).read_bytes()).hexdigest()[:16]
+    return f'/static/{name}?v={digest}'
 
 
 def dataset_meta(value):
@@ -722,12 +728,15 @@ def create_app(data_dir=None, llm_config_path=None):
         content = markdown.markdown(source, extensions=['tables', 'fenced_code', 'toc', 'attr_list'])
         content = content.replace('href="Linux部署.md', 'href="/help/deployment').replace('href="使用教程.md', 'href="/help/tutorial')
         return HTMLResponse('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-                            '<title>Eval Studio 使用帮助</title><link rel="stylesheet" href="/static/style.css"></head>'
+                            f'<title>Eval Studio 使用帮助</title><link rel="stylesheet" href="{asset_url("style.css")}"></head>'
                             '<body class="help-document"><nav><a href="/help/tutorial">使用教程</a> · <a href="/help/deployment">部署说明</a></nav><article>' + content + '</article></body></html>')
 
     @app.get('/')
     def index():
-        return FileResponse(ROOT / 'frontend' / 'index.html', headers={'Cache-Control': 'no-cache'})
+        html = (ROOT / 'frontend' / 'index.html').read_text(encoding='utf-8')
+        for name in ('app.js', 'style.css'):
+            html = html.replace('/static/' + name, asset_url(name))
+        return HTMLResponse(html, headers={'Cache-Control': 'no-cache'})
 
     app.mount('/static', StaticFiles(directory=ROOT / 'frontend'), name='static')
     return app

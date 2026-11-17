@@ -1206,6 +1206,7 @@ tr:last-child td {
 .result-table .cell-value span {display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .attempt-card {padding:9px;border:1px solid var(--border);border-radius:6px;margin:9px 0}
 .attempt-card p {font-size:12px}
+.result-table [data-output-path] .advanced,.history-results [data-output-path] .advanced {margin:0;padding:0;border:0}
 .workspace-modal-open {overflow:hidden}
 .workspace-overlay {position:fixed;inset:0;z-index:70;background:rgba(14,22,38,.55);backdrop-filter:blur(5px);display:flex;align-items:center;justify-content:center;padding:28px}
 .workspace-dialog {width:min(1260px,94vw);height:min(860px,90dvh);max-height:94dvh;display:flex;flex-direction:column;background:var(--surface,#fff);border:1px solid var(--border);border-radius:14px;box-shadow:0 24px 90px #0004;overflow:hidden}

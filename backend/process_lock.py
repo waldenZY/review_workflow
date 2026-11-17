@@ -1,4 +1,4 @@
-"""One service or offline migration per data directory, using OS-owned locks."""
+"""One service per data directory, using OS-owned locks."""
 import os
 from pathlib import Path
 

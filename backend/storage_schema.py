@@ -1,7 +1,7 @@
-"""Revision 2 splits immutable material, row state and attempts; same v1_1 directory."""
+"""Revision 3 uses per-criterion output templates; old data is not supported."""
 import json
 
-REVISION = 2
+REVISION = 3
 DATABASE = 'workbench_v1_1.sqlite3'
 DDL = '''
 CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -55,7 +55,7 @@ CREATE INDEX IF NOT EXISTS audit_project ON audit(project_id,seq);
 
 
 def install(db):
-    # executescript commits implicitly; individual statements keep migration transactional.
+    # executescript commits implicitly; individual statements keep initialization transactional.
     for statement in DDL.split(';'):
         if statement.strip():
             db.execute(statement)
@@ -100,7 +100,7 @@ def save_references(db, value):
 
 
 def attempt_summary(attempt):
-    keys = ('id', 'round_no', 'status', 'criteria', 'error', 'error_stage', 'finished_at')
+    keys = ('id', 'round_no', 'status', 'criteria', 'output', 'error', 'error_stage', 'finished_at')
     return {k: attempt.get(k) for k in keys}
 
 

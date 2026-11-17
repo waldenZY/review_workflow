@@ -39,7 +39,7 @@ class Conflict(ValueError):
 
 
 def materialize(db, project_id, rows):
-    """Import/migration only; immutable materials include row identity and original ordering."""
+    """Import only; immutable materials include row identity and original ordering."""
     digest, columns = hashlib.sha256(), {}
     for row in rows:
         encoded = dumps(row).encode('utf-8')
@@ -69,11 +69,22 @@ class Store:
         try:
             self.db = sqlite3.connect(self.path, check_same_thread=False, timeout=5)
             version = self.db.execute('PRAGMA user_version').fetchone()[0]
-            populated = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").fetchone()
-            if version != REVISION and populated:
-                raise RuntimeError('数据库需要离线升级。请停服后运行 scripts/migrate_storage.py --data-dir <数据根目录> --check，再使用 --apply。')
-            if version not in (0, REVISION):
-                raise RuntimeError('不支持的数据库结构版本。')
+            tables = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            if (version == 0 and tables) or version not in (0, REVISION):
+                raise RuntimeError('不支持旧数据或未知存储版本。请停服、备份并自行清空业务数据目录后重新启动；不提供迁移，程序不会删除旧数据。')
+            if version == REVISION:
+                expected = sqlite3.connect(':memory:')
+                try:
+                    install(expected)
+                    required = {r[0] for r in expected.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+                    if required != tables or any(
+                        self.db.execute(f'PRAGMA table_info("{table}")').fetchall()
+                        != expected.execute(f'PRAGMA table_info("{table}")').fetchall()
+                        for table in required
+                    ):
+                        raise RuntimeError('存储结构不完整或未知，拒绝自动重建。请检查备份和数据目录。')
+                finally:
+                    expected.close()
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA busy_timeout=5000')
             with self.write():
@@ -464,7 +475,7 @@ class Store:
         run = self.get_run(project_id, run_id)
         clauses, args = ['r.project_id=?', 'r.run_id=?'], [project_id, run_id]
         if status_group == 'errors':
-            clauses.append("r.status IN ('call_failed','parse_failed','schema_failed','projection_failed','interrupted')")
+            clauses.append("r.status IN ('call_failed','parse_failed','schema_failed','interrupted')")
             if error_stage:
                 clauses.append('r.error_stage=?')
                 args.append(error_stage)
@@ -482,7 +493,7 @@ class Store:
         for r in rows:
             summary, original = json.loads(r[6]), json.loads(r[7])
             records.append({'row_id': r[0], 'source_row': r[1], 'status': r[2], 'round_no': r[3], 'latest_attempt_id': r[4], 'attempt_count': r[5],
-                            'criteria': summary.get('criteria', []), 'error': summary.get('error'), 'error_stage': summary.get('error_stage'),
+                            'criteria': summary.get('criteria', []), 'output': summary.get('output'), 'error': summary.get('error'), 'error_stage': summary.get('error_stage'),
                             'result_round': summary.get('round_no'), 'fields': {p: at(original, p, None) for p in fields},
                             'missing_fields': [p for p in fields if at(original, p) is MISSING],
                             'previous_attempt': bool(r[4]) and (r[2] in ('pending', 'running') or summary.get('round_no') != r[3] or summary.get('status') != r[2])})

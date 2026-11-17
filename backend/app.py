@@ -16,14 +16,15 @@ from openpyxl import load_workbook
 
 from .data_io import MAX_IMPORT_BYTES, MISSING, at, check_import_size, fields_for, parse_file, write_xlsx
 from .engine import (Runner, check_schema, export_records, messages_for,
-                     output_example, progress, project_criteria, shared_fields,
-                     rebuild_evaluator, validate_output_contract, validate_templates)
+                     progress, shared_fields,
+                     rebuild_evaluator, validate_templates)
 from .history import History
 from .llm import Gateway, GatewayError, ModelSettings, decode_output, parse_output
-from .models import (AnalysisRequest, CloneRunRequest, ConnectionTest, Criterion, DraftPreviewRequest, EvaluatorBuildRequest, EvaluatorSave,
+from .models import (AnalysisRequest, CloneRunRequest, CompileOutputTemplate, ConnectionTest, Criterion, DraftPreviewRequest, EvaluatorBuildRequest, EvaluatorSave,
                      ExportRequest, ExtractRequest, MappingSave, ObjectDelete, PreviewRequest,
                      ProfileSave, ProjectDelete, ProjectSave, RerunRequest, RunRequest, SpecSave)
 from .store import BUSY, Conflict, Store, dumps, now, uid
+from .output_templates import compile_spec, compile_template
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -101,7 +102,7 @@ def create_app(data_dir=None, llm_config_path=None):
 
     @app.get('/api/v1/health')
     async def health():
-        return {'status': 'ok', 'version': '1.1.0', 'data_dir': str(data_root), 'database': 'workbench_v1_1.sqlite3'}
+        return {'status': 'ok', 'version': '1.1.0', 'storage_revision': 3, 'data_dir': str(data_root), 'database': 'workbench_v1_1.sqlite3'}
 
     @app.get('/api/v1/llm/status')
     @app.get('/api/v1/llm/profiles')
@@ -191,7 +192,7 @@ def create_app(data_dir=None, llm_config_path=None):
     def get_entity(project_id: str, object_id: str, version: int | None = None):
         value = store().get(project_id, object_id, version)
         if value['kind'] == 'evaluator':
-            value['example_preview'] = output_example(value['response_schema'], value.get('output_example'))
+            value.update(compile_spec(store().get(project_id, value['spec_id'], value['spec_version'], 'spec')))
         return dataset_meta(value) if value['kind'] == 'dataset' else value
 
     @router.get('/entities/{object_id}/versions')
@@ -282,8 +283,14 @@ def create_app(data_dir=None, llm_config_path=None):
                 raise ValueError('请选择数据集中存在且不重复的评测字段。')
             return store().save(project_id, 'mapping', body.model_dump(exclude={'id'}), body.id)
 
+    @router.post('/specs/compile-output-template')
+    def compile_output_template(project_id: str, body: CompileOutputTemplate):
+        store().project(project_id)
+        return compile_template(body.template)
+
     @router.post('/specs')
     def save_spec(project_id: str, body: SpecSave):
+        compile_spec(body.model_dump())
         for c in body.criteria:
             if c.method != 'llm' and not c.target_field.startswith('/'):
                 raise ValueError('程序规则必须选择作用字段。')
@@ -402,12 +409,6 @@ def create_app(data_dir=None, llm_config_path=None):
             if body.allow_rebind:
                 value.pop('id', None)
                 value['title'] += ' 副本'
-                old_names = {c['id']: c['name'] for c in old_spec['criteria']}
-                new_ids = {c['name']: c['id'] for c in spec['criteria']}
-                for item in value['projection']:
-                    name = old_names.get(item['criterion_id'])
-                    if name in new_ids:
-                        item['criterion_id'] = new_ids[name]
             return value
 
     @router.post('/evaluators')
@@ -419,22 +420,8 @@ def create_app(data_dir=None, llm_config_path=None):
 
     def validate_evaluator(spec, body):
         validate_templates(body.system_template, body.user_template)
-        check_schema(body.response_schema)
-        if body.response_schema.get('type') != 'object':
-            raise ValueError('返回 Schema 顶层必须为 object。')
-        value = body.model_dump(exclude={'id'})
-        validate_output_contract(spec, value)
-        ids = {c['id'] for c in spec['criteria'] if c['enabled'] and c['method'] == 'llm'}
-        projected = [p.criterion_id for p in body.projection]
-        if len(projected) != len(set(projected)) or any(i not in ids for i in projected):
-            raise ValueError('结果映射必须关联启用的 LLM 标准，且不可重复。')
-        for p in body.projection:
-            if not p.verdict_path.startswith('/') or any(path and not path.startswith('/') for path in (p.reason_path, p.evidence_path)):
-                raise ValueError('结果映射必须使用 JSON Pointer。')
-        example = output_example(body.response_schema, body.output_example)
-        if example['value'] is not None:
-            project_criteria(example['value'], spec, value)
-        return value, example
+        value = body.model_dump(exclude={'id'}) | compile_spec(spec)
+        return value, value['example_preview']
 
     def context(project_id, body):
         mapping = store().get(project_id, body.mapping_id, body.mapping_version, 'mapping', True)
@@ -459,7 +446,7 @@ def create_app(data_dir=None, llm_config_path=None):
             messages = messages_for(snapshot['mapping'], snapshot['spec'], snapshot['evaluator'], row)
             return {'messages': messages, 'request': app.state.gateway.preview(messages, connection), 'draft': False,
                     'versions': {k: snapshot[k]['version'] for k in ('mapping', 'spec', 'evaluator')},
-                    'example': output_example(snapshot['evaluator']['response_schema'], snapshot['evaluator'].get('output_example'))}
+                    'example': snapshot['evaluator']['example_preview']}
 
     @router.post('/requests/preview-draft')
     def preview_draft(project_id: str, body: DraftPreviewRequest):
@@ -561,7 +548,7 @@ def create_app(data_dir=None, llm_config_path=None):
             'project':snap['project'], 'dataset':dataset_meta(snap['dataset']),
             'mapping':{k:snap['mapping'][k] for k in ('id','version','evaluation_fields')},
             'spec':{k:snap['spec'][k] for k in ('id','version','title')},
-            'evaluator':{k:snap['evaluator'][k] for k in ('id','version','spec_id','spec_version')},
+            'evaluator':{k:snap['evaluator'][k] for k in ('id','version','spec_id','spec_version','output_fields')},
             'model_config':snap['model_config'], 'execution_config':snap.get('execution_config',{'batch_concurrency':1})},
             'original_columns':snap['dataset']['original_columns'], 'exports':store().exports(project_id,run_id)}
 
@@ -578,7 +565,7 @@ def create_app(data_dir=None, llm_config_path=None):
     def run_records(project_id: str, run_id: str, offset: int=0, limit: int=20, status_group: str='all', error_stage: str=''):
         if offset<0 or limit not in (10,20,50):
             raise ValueError('offset 必须非负，limit 仅支持 10、20、50。')
-        if error_stage and (status_group!='errors' or error_stage not in ('call_failed','parse_failed','schema_failed','projection_failed','scheduler_failed')):
+        if error_stage and (status_group!='errors' or error_stage not in ('call_failed','parse_failed','schema_failed','scheduler_failed')):
             raise ValueError('错误阶段筛选仅用于执行异常。')
         return store().record_page(project_id,run_id,offset,limit,status_group,error_stage)
 
@@ -666,15 +653,16 @@ def create_app(data_dir=None, llm_config_path=None):
                             count+=1
                 else:
                     first=next(records)
-                    extras=['eval.'+c for c in first['evaluation']]
+                    result_fields=run['snapshot']['evaluator']['output_fields']
+                    extras=['eval.'+c for c in first['evaluation']]+['result'+f['path'] for f in result_fields]
                     if set(columns)&set(extras):
-                        raise ValueError('原始列与 eval.* 列冲突，请使用 JSONL 或调整原始列名。')
+                        raise ValueError('原始列与 eval.* 或 result/ 结果列冲突，请使用 JSONL 或调整原始列名。')
                     from itertools import chain
                     def excel_rows():
                         nonlocal count
                         for r in chain((first,),records):
                             count+=1
-                            yield [*[r['original'][c] for c in columns],*r['evaluation'].values()]
+                            yield [*[r['original'][c] for c in columns],*r['evaluation'].values(),*[at(r['evaluation']['output'], f['path'], None) for f in result_fields]]
                     write_xlsx(target,excel_rows(),columns+extras)
                 metadata={'format':body.format,'file':target.name,'original_fields':columns,
                     'include_raw_response':body.include_raw_response,'model_config':run['snapshot']['model_config'],

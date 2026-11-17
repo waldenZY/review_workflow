@@ -1,11 +1,9 @@
-from typing import Any, Literal, get_args
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-Verdict = Literal['pass', 'fail', 'insufficient_evidence', 'not_applicable']
-VERDICTS = get_args(Verdict)
-
+TemplateText = Annotated[str, StringConstraints(strip_whitespace=False)]
 
 class Input(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
@@ -41,6 +39,7 @@ class Criterion(Input):
     description: str = ''
     enabled: bool = True
     method: Literal['llm', 'non_empty', 'json_schema'] = 'llm'
+    output_template: TemplateText = ''
     target_field: str = ''
     rule_schema: dict[str, Any] = Field(default_factory=lambda: {'type': 'object'})
 
@@ -66,11 +65,8 @@ class SpecSave(Input):
         return self
 
 
-class Projection(Input):
-    criterion_id: str
-    verdict_path: str
-    reason_path: str = ''
-    evidence_path: str = ''
+class CompileOutputTemplate(Input):
+    template: TemplateText
 
 
 class BuildRequest(Input):
@@ -83,9 +79,6 @@ class EvaluatorSave(BuildRequest):
     title: str = Field(min_length=1)
     system_template: str = Field(min_length=1)
     user_template: str = Field(min_length=1)
-    response_schema: dict[str, Any]
-    projection: list[Projection] = Field(default_factory=list)
-    output_example: dict[str, Any] | None = None
 
 
 class EvaluatorBuildRequest(BuildRequest):

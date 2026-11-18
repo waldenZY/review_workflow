@@ -106,10 +106,10 @@ def compile_template(template):
     return TemplateParser(template).parse()
 
 
-def compile_spec(spec):
+def compile_standards(standards):
     properties, fields, example = {}, [], {}
-    for criterion in spec['criteria']:
-        if not criterion['enabled'] or criterion['method'] != 'llm':
+    for criterion in standards:
+        if criterion['method'] != 'llm':
             continue
         name = criterion['name']
         if name in properties:
@@ -121,7 +121,7 @@ def compile_spec(spec):
         properties[name] = result['response_schema']
         example[name] = result['example']
         for field in result['output_fields']:
-            fields.append({**field, 'criterion_id': criterion['id'], 'criterion_name': name,
+            fields.append({**field, 'standard_id': criterion['id'], 'standard_name': name,
                            'path': '/' + pointer(name) + field['path']})
     return {'response_schema': {'type': 'object', 'properties': properties,
             'required': list(properties), 'additionalProperties': False},

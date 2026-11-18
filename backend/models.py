@@ -33,97 +33,83 @@ class MappingSave(Input):
     evaluation_fields: list[str] = Field(min_length=1)
 
 
-class Criterion(Input):
-    id: str = Field(default_factory=lambda: 'criterion_' + uuid4().hex, min_length=1, max_length=80, pattern=r'^[A-Za-z0-9_-]+$')
-    name: str = Field(min_length=1)
+class StandardSave(Input):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=120)
     description: str = ''
-    enabled: bool = True
     method: Literal['llm', 'non_empty', 'json_schema'] = 'llm'
     output_template: TemplateText = ''
     target_field: str = ''
     rule_schema: dict[str, Any] = Field(default_factory=lambda: {'type': 'object'})
 
 
-class SpecSave(Input):
-    id: str | None = None
-    title: str = Field(min_length=1)
-    generation_prompt: str = ''
-    design_notes: str = ''
-    criteria: list[Criterion] = Field(min_length=1)
-    design_call_ids: list[str] = Field(default_factory=list)
-
-    @model_validator(mode='after')
-    def check_criteria(self):
-        ids = [c.id for c in self.criteria]
-        if len(ids) != len(set(ids)):
-            raise ValueError('标准 ID 不可重复。')
-        names = [c.name for c in self.criteria]
-        if len(names) != len(set(names)):
-            raise ValueError('同一方案内的标准名称不可重复。')
-        if not any(c.enabled for c in self.criteria):
-            raise ValueError('至少启用一条标准。')
-        return self
-
-
 class CompileOutputTemplate(Input):
     template: TemplateText
 
 
-class BuildRequest(Input):
-    spec_id: str
-    spec_version: int = Field(ge=1)
+class StandardRef(Input):
+    standard_id: str
+    version: int = Field(ge=1)
 
 
-class EvaluatorSave(BuildRequest):
+class PlanGroup(Input):
+    id: str = Field(default_factory=lambda: 'group_' + uuid4().hex, min_length=1, max_length=80, pattern=r'^[A-Za-z0-9_-]+$')
+    name: str = Field(min_length=1, max_length=120)
+    standards: list[StandardRef] = Field(min_length=1)
+
+
+class PlanSave(Input):
     id: str | None = None
-    title: str = Field(min_length=1)
-    system_template: str = Field(min_length=1)
-    user_template: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=120)
+    system_template: TemplateText = Field(min_length=1)
+    user_template: TemplateText = Field(min_length=1)
+    groups: list[PlanGroup] = Field(min_length=1)
+
+    @model_validator(mode='after')
+    def unique(self):
+        for values, label in (([g.id for g in self.groups], '组 ID'), ([g.name for g in self.groups], '组名'),
+                              ([r.standard_id for g in self.groups for r in g.standards], '标准')):
+            if len(values) != len(set(values)):
+                raise ValueError(label + '不可重复。')
+        return self
 
 
-class EvaluatorBuildRequest(BuildRequest):
-    source: EvaluatorSave | None = None
-    allow_rebind: bool = False
-
-
-class ContextRequest(Input):
+class GroupInputBinding(Input):
+    group_id: str
     mapping_id: str
     mapping_version: int = Field(ge=1)
-    evaluator_id: str
-    evaluator_version: int = Field(ge=1)
 
 
-class PreviewRequest(ContextRequest):
-    row_id: str
-
-
-class DraftPreviewRequest(Input):
+class RunRequest(Input):
     dataset_id: str
-    row_id: str
-    evaluation_fields: list[str] = Field(min_length=1)
-    spec: SpecSave
-    evaluator: EvaluatorSave
-
-
-class RunRequest(ContextRequest):
+    dataset_version: int = Field(ge=1)
+    plan_id: str
+    plan_version: int = Field(ge=1)
+    bindings: list[GroupInputBinding] = Field(min_length=1)
     selection_mode: Literal['selected', 'all'] = 'selected'
     row_ids: list[str] = Field(default_factory=list)
+    mode: Literal['trial', 'batch'] = 'batch'
 
 
-class RerunRequest(ContextRequest):
-    row_ids: list[str] = Field(min_length=1)
-
-
-class ExtractRequest(Input):
-    generation_prompt: str = Field(min_length=1)
-
-
-class AnalysisRequest(Input):
-    mapping_id: str
-    mapping_version: int = Field(ge=1)
-    spec_id: str
-    spec_version: int = Field(ge=1)
+class PlanPreview(Input):
+    plan: PlanSave
+    dataset_id: str
+    dataset_version: int = Field(ge=1)
+    bindings: list[GroupInputBinding] = Field(min_length=1)
     row_id: str
+
+
+class StandardTest(Input):
+    standard: StandardSave
+    saved_version: int | None = Field(default=None, ge=1)
+    source: Literal['dataset', 'json']
+    dataset_id: str | None = None
+    dataset_version: int | None = Field(default=None, ge=1)
+    mapping_id: str | None = None
+    mapping_version: int | None = Field(default=None, ge=1)
+    row_id: str | None = None
+    json_text: TemplateText = ''
+    evaluation_fields: list[str] | None = None
 
 
 class ExportRequest(Input):

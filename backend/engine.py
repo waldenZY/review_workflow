@@ -1,4 +1,3 @@
-import copy
 import json
 import logging
 import queue
@@ -13,7 +12,7 @@ from jsonschema import Draft202012Validator
 
 from .data_io import at
 from .llm import GatewayError, strict_json, validate_execution
-from .output_templates import compile_spec, decode_evaluation
+from .output_templates import decode_evaluation
 from .store import now, uid
 
 log = logging.getLogger(__name__)
@@ -64,57 +63,42 @@ def validate_templates(system, user):
         raise ValueError('至少包含 {{output_instructions}} 或 {{response_schema}} 一种返回约束变量。')
 
 
-def judge_criteria(spec):
-    return [{'name': c['name'], 'description': c['description']} for c in spec['criteria'] if c['enabled'] and c['method'] == 'llm']
+def judge_criteria(standards):
+    return [{'name': c['name'], 'description': c['description']} for c in standards if c['method'] == 'llm']
 
 
-def output_instructions(spec):
-    contract = compile_spec(spec)
+def output_instructions(group):
     return ('仅返回一个 JSON 对象，不使用代码围栏或外围解释。顶层键为全部启用 LLM 标准的名称，每组分别符合自己的结构。'
             '所有字段必填，不允许额外字段。单选精确匹配候选值，多选可为空且不能重复。数值必须有限。'
-            '以下为严格结构规则：\n' + json.dumps(contract['response_schema'], ensure_ascii=False, indent=2)
+            '以下为严格结构规则：\n' + json.dumps(group['response_schema'], ensure_ascii=False, indent=2)
             + '\n以下仅演示结构，不代表默认答案或实际判断：\n'
-            + json.dumps(contract['example_preview']['value'], ensure_ascii=False, indent=2))
+            + json.dumps(group['example_preview']['value'], ensure_ascii=False, indent=2))
 
 
 def shared_fields(mapping, row):
     return {path: at(row['original'], path, None) for path in mapping['evaluation_fields']}
 
 
-def messages_for(mapping, spec, evaluator, row):
-    validate_templates(evaluator['system_template'], evaluator['user_template'])
-    values = {'fields': shared_fields(mapping, row), 'criteria': judge_criteria(spec),
-              'response_schema': evaluator['response_schema']}
+def messages_for(group, row):
+    mapping, standards = group['mapping'], group['standards']
+    validate_templates(group['system_template'], group['user_template'])
+    values = {'fields': shared_fields(mapping, row), 'criteria': judge_criteria(standards),
+              'response_schema': group['response_schema']}
     values = {k: json.dumps(v, ensure_ascii=False, allow_nan=False, indent=2) for k, v in values.items()}
-    values['output_instructions'] = output_instructions(spec)
-    return [{'role': role, 'content': VARIABLE.sub(lambda m: values[m.group(1).strip()], evaluator[key])}
+    values['output_instructions'] = output_instructions(group)
+    return [{'role': role, 'content': VARIABLE.sub(lambda m: values[m.group(1).strip()], group[key])}
             for role, key in [('system', 'system_template'), ('user', 'user_template')]]
-
-
-def default_evaluator(spec):
-    return {'title': spec['title'] + ' · 评测器', 'spec_id': spec['id'], 'spec_version': spec['version'],
-            'system_template': SYSTEM, 'user_template': USER, **compile_spec(spec)}
-
-
-def rebuild_evaluator(spec, source_spec=None, source=None):
-    value = default_evaluator(spec)
-    if source is not None:
-        for key in ('system_template', 'user_template', 'title'):
-            value[key] = source[key]
-        if source.get('id'):
-            value['id'] = source['id']
-    return {**value, 'sync_notice': '输出结构由当前标准版本生成；请检查消息后保存评测器。'}
 
 
 def evaluate(snapshot, row, gateway, connection, client=None):
     started = time.perf_counter()
     parse_started = None
-    spec, mapping, evaluator = (snapshot[k] for k in ('spec', 'mapping', 'evaluator'))
+    standards = snapshot['standards']
     attempt = {'id': uid('attempt'), 'started_at': now(), 'finished_at': None, 'status': 'running', 'model_called': False,
                'request': None, 'raw_response': None, 'raw_output': None, 'normalized_output': None, 'normalization': [],
                'parsed': None, 'output': None, 'criteria': [], 'error': None, 'error_stage': None, 'usage': None, 'latency_ms': None}
-    for c in spec['criteria']:
-        if not c['enabled'] or c['method'] == 'llm':
+    for c in standards:
+        if c['method'] == 'llm':
             continue
         value = at(row['original'], c['target_field'], None)
         if c['method'] == 'non_empty':
@@ -126,19 +110,19 @@ def evaluate(snapshot, row, gateway, connection, client=None):
                 error = schema_error(c['rule_schema'], decoded)
             except (ValueError, TypeError) as exc:
                 error = '字段不是合法 JSON：' + str(exc)
-        attempt['criteria'].append({'criterion_id': c['id'], 'name': c['name'], 'source': c['method'],
+        attempt['criteria'].append({'standard_id': c['id'], 'name': c['name'], 'source': c['method'],
             'verdict': 'fail' if error else 'pass', 'reason': error or '通过内置规则校验。', 'evidence': [c['target_field']]})
     stage = 'call_failed'
     try:
-        if any(c['enabled'] and c['method'] == 'llm' for c in spec['criteria']):
-            attempt.update(gateway.invoke(messages_for(mapping, spec, evaluator, row), connection, client=client))
+        if any(c['method'] == 'llm' for c in standards):
+            attempt.update(gateway.invoke(messages_for(snapshot, row), connection, client=client))
             parse_started = time.perf_counter()
             stage = 'parse_failed'
             text = attempt['raw_output'].strip()
             attempt.update(normalized_output=text)
             attempt['parsed'] = decode_evaluation(text)
             stage = 'schema_failed'
-            error = schema_error(evaluator['response_schema'], attempt['parsed'])
+            error = schema_error(snapshot['response_schema'], attempt['parsed'])
             if error:
                 raise ValueError('JSON 可解析，但不符合返回 Schema：' + error)
             attempt['output'] = attempt['parsed']
@@ -152,10 +136,6 @@ def evaluate(snapshot, row, gateway, connection, client=None):
                          'request_ms': attempt.get('latency_ms'),
                          'parse_validation_ms': round((time.perf_counter()-parse_started)*1000, 2) if parse_started else None}
     return attempt
-
-
-def progress(run):
-    return run['progress']
 
 
 class Runner:
@@ -225,7 +205,8 @@ class Runner:
                 return
             run = self.store.start_run(project_id, run_id)
         snapshot = run['snapshot']
-        has_llm = any(c['enabled'] and c['method']=='llm' for c in snapshot['spec']['criteria'])
+        has_llm = any(c['method']=='llm' for g in snapshot['groups'] for c in g['standards'])
+        group_by_id = {g['id']:g for g in snapshot['groups']}
         limit = validate_execution(snapshot.get('execution_config', {}))['batch_concurrency'] if has_llm else 1
         pool = ThreadPoolExecutor(max_workers=limit, thread_name_prefix='judge-row')
         client = httpx.Client(timeout=connection.timeout, follow_redirects=False, trust_env=False,
@@ -236,8 +217,8 @@ class Runner:
 
         def work_row(row_id, dispatched):
             try:
-                row = self.store.data_row(project_id, snapshot['dataset']['material_id'], row_id)
-                result = evaluate(snapshot, row, self.gateway, connection, client)
+                row = self.store.data_row(project_id, snapshot['dataset']['material_id'], row_id[0])
+                result = evaluate(group_by_id[row_id[1]], row, self.gateway, connection, client)
                 result.setdefault('timing', {}).update(queue_wait_ms=queue_ms, dispatch_wait_ms=round((dispatched-round_started)*1000, 2),
                     worker_wait_ms=round((time.perf_counter()-dispatched)*1000-result.get('timing',{}).get('work_ms',0),2))
                 return result
@@ -333,7 +314,10 @@ class Runner:
                     self.phase_versions[(project_id, run_id)] = self.phase_sequence
         with self.store.lock:
             if not self.stop.is_set():
-                self.store.finish_run(project_id, run_id, fatal)
+                result = self.store.finish_run(project_id, run_id, fatal, auto_retry=True)
+                if result['status'] == 'queued':
+                    # Reuse the immutable submitted connection; append to the shared FIFO.
+                    self.submit(result, connection)
 
     def close(self):
         with self.store.lock:
@@ -345,22 +329,32 @@ def export_records(store, run, original_fields=None, include_raw=False):
     project_id, run_id = run['project_id'], run['id']
     columns = run['snapshot']['dataset']['original_columns']
     if original_fields is not None:
-        if any(k not in columns for k in original_fields):
-            raise ValueError('导出包含不存在的原始列。')
-        required = {p.split('/')[1].replace('~1','/').replace('~0','~') for p in run['snapshot']['mapping']['evaluation_fields']}
+        if len(original_fields)!=len(set(original_fields)) or any(k not in columns for k in original_fields):
+            raise ValueError('导出包含不存在或重复的原始列。')
+        required = {p.split('/')[1].replace('~1','/').replace('~0','~') for g in run['snapshot']['groups'] for p in g['mapping']['evaluation_fields']}
         columns = [k for k in columns if k in set(original_fields)|required]
 
     def records():
-        for row in store.export_batches(project_id, run_id):
-            attempt = row['attempt'] or {}
-            evaluation = {'project_id': project_id, 'run_id': run_id, 'row_id': row['row_id'], 'source_row': row['source_row'],
-                'attempt_id': attempt.get('id'), 'round_no': attempt.get('round_no'), 'status': row['status'],
-                'error': attempt.get('error'), 'error_stage': attempt.get('error_stage'), 'criteria': attempt.get('criteria', []),
-                'parsed': attempt.get('parsed'), 'output': attempt.get('output'), 'model_called': attempt.get('model_called',False),
-                'usage': attempt.get('usage'), 'latency_ms': attempt.get('latency_ms'),
-                'versions': {k:{'id':run['snapshot'][k]['id'],'version':run['snapshot'][k]['version']} for k in ('dataset','mapping','spec','evaluator')},
-                'model_config':run['snapshot']['model_config'], 'execution_config':run['snapshot'].get('execution_config',{'batch_concurrency':1})}
+        for row in store.export_batches(project_id,run_id):
+            groups = row['groups']
+            # Unselected rows explicitly retain a not_run entry for every group.
+            if not groups:
+                groups = [{'group_id':g['id'],'status':'not_run','output':None,'error':None,'attempt_count':0,'auto_retry_count':0} for g in run['snapshot']['groups']]
+            definitions={g['id']:g for g in run['snapshot']['groups']}
+            for group in groups:
+                definition=definitions[group['group_id']]
+                group.update(group_name=definition['name'],
+                    mapping={k:definition['mapping'][k] for k in ('id','version','evaluation_fields')},
+                    standards=[{k:s[k] for k in ('id','version','name','method')} for s in definition['standards']])
             if include_raw:
-                evaluation.update(raw_output=attempt.get('raw_output'),raw_response=attempt.get('raw_response'))
-            yield {'original':{k:row['original'].get(k) for k in columns}, 'evaluation':evaluation}
+                detail = store.record_detail(project_id,run_id,row['row_id']) if row['status']!='not_run' else {'attempts':[]}
+                for g in groups:
+                    g['attempts']=[a for a in detail['attempts'] if a['group_id']==g['group_id']]
+            evaluation = {'project_id':project_id,'run_id':run_id,'row_id':row['row_id'],'source_row':row['source_row'],
+                'status':row['status'],'output':row['output'],'groups':groups,'mode':run['mode'],
+                'auto_retry_policy':run['snapshot']['auto_retry_policy'],
+                'versions':{'dataset':{'id':run['snapshot']['dataset']['id'],'version':run['snapshot']['dataset']['version']},
+                            'plan':{'id':run['snapshot']['plan']['id'],'version':run['snapshot']['plan']['version']}},
+                'model_config':run['snapshot']['model_config'],'execution_config':run['snapshot']['execution_config']}
+            yield {'original':{k:row['original'].get(k) for k in columns},'evaluation':evaluation}
     return columns, records()

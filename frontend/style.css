@@ -1217,6 +1217,17 @@ tr:last-child td {
 .workspace-dialog-body th,.workspace-dialog-body td {padding:8px 10px;vertical-align:top}
 .workspace-dialog-actions {display:flex;flex-wrap:wrap;gap:8px;padding:14px 0;border-top:1px solid var(--border);margin-top:18px}
 .workspace-dialog-body .context-grid {margin:12px 0}
+.binding-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
+.standard-ref {display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 0;border-top:1px solid var(--border)}
+.standard-ref .field,.toolbar>.field {margin:0;min-width:130px;max-width:360px;flex:1}
+.standard-ref>span {font-size:12px;color:var(--muted)}
+.result-cell {max-width:330px;min-width:110px;font-size:12px}
+.result-cell summary {overflow-wrap:anywhere;white-space:pre-wrap;cursor:pointer}
+.result-cell pre {white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto}
+.results-table td>small {display:block;max-width:250px;margin:5px 0}
+.results-table thead th {text-align:center}
+.workspace-dialog-body pre {overflow-wrap:anywhere;white-space:pre-wrap}
+.toolbar>select {width:auto;max-width:230px}
 .history-results {min-width:850px}
 .history-results td {min-width:95px;max-width:310px;overflow-wrap:anywhere}
 .history-results .advanced summary {max-width:230px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

@@ -29,13 +29,13 @@ class History:
             objects = self.store.runs(project_id, include_archived) if k == 'run' else self.store.entities(project_id, k, include_archived, summary=True)
             for v in objects:
                 refs = self.references(project_id, k, v['id'])
-                values.append({'id': v['id'], 'kind': k, 'name': v.get('title') or v.get('filename') or v.get('purpose') or v['id'],
+                values.append({'id': v['id'], 'kind': k, 'name': v.get('title') or v.get('name') or v.get('filename') or v.get('purpose') or v['id'],
                                'version': v.get('version'), 'created_at': v['created_at'], 'status': v.get('status'),
                                'archived_at': v.get('archived_at'), 'references': refs, 'can_delete': not refs and v.get('status') not in BUSY})
         return sorted(values, key=lambda v: v['created_at'], reverse=True)
 
     def busy(self, project_id):
-        values = [v for v in [*self.store.runs(project_id, True), *self.store.entities(project_id, 'design_call', True, summary=True)] if v.get('status') in BUSY]
+        values = [v for v in [*self.store.runs(project_id, True), *self.store.entities(project_id, 'standard_test', True, summary=True)] if v.get('status') in BUSY]
         with self.store.lock:
             values.extend({'id':r,'status':'exporting'} for p,r in self.store.exporting if p==project_id)
         return values
@@ -139,7 +139,7 @@ class History:
             folder = self.project_dir(project_id)
 
             def mutate():
-                for table in ('attempt_metrics','attempts','run_records','run_rounds','data_rows','materials','object_refs','entities','runs','exports','lifecycle','audit'):
+                for table in ('attempt_metrics','attempts','group_tasks','run_records','run_rounds','data_rows','materials','object_refs','entities','runs','exports','lifecycle','audit'):
                     self.store.db.execute(f'DELETE FROM {table} WHERE project_id=?', (project_id,))
                 self.store.db.execute('DELETE FROM projects WHERE id=?', (project_id,))
 
@@ -167,7 +167,7 @@ class History:
             def mutate():
                 if kind == 'run':
                     self.store.db.execute('DELETE FROM attempt_metrics WHERE project_id=? AND id IN (SELECT id FROM attempts WHERE project_id=? AND run_id=?)', (project_id, project_id, object_id))
-                    for table in ('attempts','run_records','run_rounds'):
+                    for table in ('attempts','group_tasks','run_records','run_rounds'):
                         self.store.db.execute(f'DELETE FROM {table} WHERE project_id=? AND run_id=?', (project_id, object_id))
                     self.store.db.execute('DELETE FROM runs WHERE project_id=? AND id=?', (project_id, object_id))
                     self.store.db.execute('DELETE FROM exports WHERE project_id=? AND run_id=?', (project_id, object_id))

@@ -1,7 +1,7 @@
-"""Revision 3 uses per-criterion output templates; old data is not supported."""
+"""Revision 4: independent standards and bounded group tasks. No migrations."""
 import json
 
-REVISION = 3
+REVISION = 4
 DATABASE = 'workbench_v1_1.sqlite3'
 DDL = '''
 CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -19,18 +19,26 @@ CREATE TABLE IF NOT EXISTS runs(project_id TEXT NOT NULL,id TEXT NOT NULL,body T
     status TEXT NOT NULL,material_id TEXT NOT NULL,current_round INTEGER NOT NULL DEFAULT 0,
     selected INTEGER NOT NULL DEFAULT 0,processed INTEGER NOT NULL DEFAULT 0,
     running INTEGER NOT NULL DEFAULT 0,pending INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,
-    succeeded INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(project_id,id));
+    succeeded INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,
+    rows_selected INTEGER NOT NULL DEFAULT 0,rows_succeeded INTEGER NOT NULL DEFAULT 0,
+    rows_running INTEGER NOT NULL DEFAULT 0,rows_pending INTEGER NOT NULL DEFAULT 0,rows_failed INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(project_id,id));
 CREATE INDEX IF NOT EXISTS runs_project_status ON runs(project_id,status);
 CREATE TABLE IF NOT EXISTS run_records(project_id TEXT NOT NULL,run_id TEXT NOT NULL,row_id TEXT NOT NULL,
-    source_order INTEGER NOT NULL,source_row INTEGER NOT NULL,status TEXT NOT NULL,round_no INTEGER,
-    latest_attempt_id TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,summary TEXT NOT NULL DEFAULT '{}',
-    error_stage TEXT,PRIMARY KEY(project_id,run_id,row_id));
+    source_order INTEGER NOT NULL,source_row INTEGER NOT NULL,status TEXT NOT NULL,
+    PRIMARY KEY(project_id,run_id,row_id));
 CREATE INDEX IF NOT EXISTS records_order ON run_records(project_id,run_id,source_order);
 CREATE INDEX IF NOT EXISTS records_status ON run_records(project_id,run_id,status,source_order);
-CREATE INDEX IF NOT EXISTS records_error ON run_records(project_id,run_id,error_stage,source_order);
+CREATE TABLE IF NOT EXISTS group_tasks(project_id TEXT NOT NULL,run_id TEXT NOT NULL,row_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,group_order INTEGER NOT NULL,source_order INTEGER NOT NULL,status TEXT NOT NULL,round_no INTEGER NOT NULL,
+    latest_attempt_id TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,auto_retry_count INTEGER NOT NULL DEFAULT 0,
+    summary TEXT NOT NULL DEFAULT '{}',error_stage TEXT,
+    PRIMARY KEY(project_id,run_id,row_id,group_id));
+CREATE INDEX IF NOT EXISTS tasks_pending ON group_tasks(project_id,run_id,status,source_order,group_order);
+CREATE INDEX IF NOT EXISTS tasks_errors ON group_tasks(project_id,run_id,group_id,error_stage,row_id);
 CREATE TABLE IF NOT EXISTS attempts(project_id TEXT NOT NULL,run_id TEXT NOT NULL,row_id TEXT NOT NULL,
-    id TEXT NOT NULL,ordinal INTEGER NOT NULL,round_no INTEGER,body TEXT NOT NULL,
-    PRIMARY KEY(project_id,id),UNIQUE(project_id,run_id,row_id,ordinal));
+    group_id TEXT NOT NULL,id TEXT NOT NULL,ordinal INTEGER NOT NULL,round_no INTEGER,body TEXT NOT NULL,
+    PRIMARY KEY(project_id,id),UNIQUE(project_id,run_id,row_id,group_id,ordinal));
 CREATE INDEX IF NOT EXISTS attempts_record ON attempts(project_id,run_id,row_id,ordinal);
 CREATE TABLE IF NOT EXISTS attempt_metrics(project_id TEXT NOT NULL,id TEXT NOT NULL,body TEXT NOT NULL,
     PRIMARY KEY(project_id,id));
@@ -68,7 +76,7 @@ def entity_summary(value):
         keys = ('id', 'project_id', 'kind', 'version', 'filename', 'row_count', 'created_at')
         return {k: value[k] for k in keys}
     keys = ('id', 'project_id', 'kind', 'version', 'title', 'created_at', 'status', 'purpose',
-            'spec_id', 'spec_version')
+            'name', 'method', 'draft')
     return {k: value[k] for k in keys if k in value}
 
 
@@ -79,14 +87,15 @@ def references(value):
         refs.append(('material', value['material_id']))
     if kind == 'mapping':
         refs.append(('dataset', value['dataset_id']))
-    elif kind == 'evaluator':
-        refs.append(('spec', value['spec_id']))
-    elif kind == 'spec':
-        refs.extend(('design_call', i) for i in value.get('design_call_ids', []))
-    elif kind == 'design_call':
+    elif kind == 'execution_plan':
+        refs.extend(('standard', r['standard_id']) for g in value['groups'] for r in g['standards'])
+    elif kind == 'standard_test':
         refs.extend((r['kind'], r['id']) for r in value.get('references', []))
     elif kind == 'run':
-        refs.extend((k, value['snapshot'][k]['id']) for k in ('dataset', 'mapping', 'spec', 'evaluator'))
+        snap = value['snapshot']
+        refs.extend((k, snap[key]['id']) for k, key in (('dataset','dataset'),('execution_plan','plan')))
+        refs.extend(('mapping', g['mapping']['id']) for g in snap['groups'])
+        refs.extend(('standard', s['id']) for g in snap['groups'] for s in g['standards'])
         if value.get('parent_run_id'):
             refs.append(('run', value['parent_run_id']))
         refs.append(('material', value['snapshot']['dataset']['material_id']))

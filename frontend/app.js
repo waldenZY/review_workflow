@@ -9,7 +9,12 @@
   const labels={queued:'排队中',running:'执行中',cancelling:'正在取消',cancelled:'已取消',completed:'完成',completed_with_errors:'完成，有异常',call_failed:'调用失败',parse_failed:'JSON 解析失败',schema_failed:'结构校验失败',interrupted:'中断',pending:'未执行',not_run:'未选中',failed:'任务异常',error:'异常',design_running:'测试中'};
   const s={page:0,epoch:0,project:null,projects:[],catalog:{datasets:[],mappings:[],standards:[],plans:[]},busy:false,error:'',notice:'',modal:null,llm:{profiles:[]},versions:{},defaults:null};
   let templateSeq=0,previewSeq=0,rowSeq=0,templateTimer,previewTimer,polling=false;
-  const uid=()=>`group_${crypto.randomUUID().replaceAll('-','')}`;
+  function uid() {
+    // The randomUUID method can be unavailable when the workbench is served over plain HTTP.
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    return `group_${hex}`;
+  }
   const blankStandard=()=>({name:'',description:'',method:'llm',output_template:'',target_field:'',rule_schema:{type:'object'}});
   function reset(){Object.assign(s,{versions:{},backModal:null,addStandard:'',upload:null,sheet:'',header:1,testsAll:false,historyArchived:false,dataset:null,mapping:{title:'字段方案',evaluation_fields:[]},mappingDirty:false,rows:[],offset:0,size:20,selected:[],standard:blankStandard(),standardDirty:false,standardVersion:null,plan:null,planDirty:false,bindings:{},groupChecks:[],templateCheck:null,testForm:null,testResult:null,tests:[],testOffset:0,testTotal:0,activeView:null,history:[],historyOffset:0,historyTotal:0,historyStatus:'',historyDataset:'',selectionMode:'selected',parentRun:null,includeRaw:false,exportFields:null});++templateSeq;++previewSeq;++rowSeq;clearTimeout(templateTimer);clearTimeout(previewTimer);}
   reset();

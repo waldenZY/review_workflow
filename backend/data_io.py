@@ -6,6 +6,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 
 MISSING = object()
@@ -128,6 +129,15 @@ def write_xlsx(path, rows, columns):
     workbook=Workbook(write_only=True)
     ws=workbook.create_sheet('评测结果')
     ws.freeze_panes='A2'
+    overflow = None
+    overflow_rows = 1
+
+    def cell_for(sheet, value):
+        cell = WriteOnlyCell(sheet, value=value)
+        if isinstance(value, str):
+            cell.data_type = 's'
+        return cell
+
     try:
         from itertools import chain
         count=0
@@ -138,12 +148,27 @@ def write_xlsx(path, rows, columns):
             for col_index,value in enumerate(row,1):
                 if isinstance(value,(dict,list)):
                     value=json.dumps(value,ensure_ascii=False,allow_nan=False)
-                if isinstance(value,str) and len(value)>32767:
-                    raise ValueError(f'第 {row_index} 行第 {col_index} 列超过 Excel 单元格限制；请使用 JSONL。')
-                cell=WriteOnlyCell(ws,value=value)
-                if isinstance(value,str):
-                    cell.data_type='s'
-                cells.append(cell)
+                if isinstance(value, str):
+                    invalid_xml = bool(ILLEGAL_CHARACTERS_RE.search(value)) or '\ufffe' in value or '\uffff' in value
+                    too_long = len(value) > 32767 or (len(value) > 16383 and len(value.encode('utf-16-le')) > 65534)
+                    if invalid_xml or too_long:
+                        if row_index == 1:
+                            raise ValueError(f'第 {col_index} 个列名超过 Excel 限制或含不支持的字符，请使用 JSONL。')
+                        if overflow is None:
+                            overflow = workbook.create_sheet('长文本')
+                            overflow.freeze_panes = 'A2'
+                            overflow.append(['结果表行号', '结果表列号', '列名', '分段序号', '内容格式', '内容'])
+                        content = json.dumps(value, ensure_ascii=True) if invalid_xml else value
+                        content_format = 'JSON 字符串' if invalid_xml else '原文'
+                        for index, start in enumerate(range(0, len(content), 16383), 1):
+                            overflow_rows += 1
+                            if overflow_rows > 1048576:
+                                raise ValueError('长文本超过 XLSX 行容量，请使用 JSONL。')
+                            part = content[start:start + 16383]
+                            overflow.append([row_index, col_index, cell_for(overflow, columns[col_index - 1]),
+                                             index, content_format, cell_for(overflow, part)])
+                        value = f'完整内容见「长文本」第 {row_index} 行、第 {col_index} 列对应的分段'
+                cells.append(cell_for(ws, value))
             ws.append(cells)
             count=row_index
         from openpyxl.utils import get_column_letter

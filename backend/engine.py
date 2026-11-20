@@ -344,7 +344,7 @@ def export_records(store, run, original_fields=None, include_raw=False):
             for group in groups:
                 definition=definitions[group['group_id']]
                 group.update(group_name=definition['name'],
-                    mapping={k:definition['mapping'][k] for k in ('id','version','evaluation_fields')},
+                    mapping={k:definition['mapping'][k] for k in ('id','version','evaluation_fields') if k in definition['mapping']},
                     standards=[{k:s[k] for k in ('id','version','name','method')} for s in definition['standards']])
             if include_raw:
                 detail = store.record_detail(project_id,run_id,row['row_id']) if row['status']!='not_run' else {'attempts':[]}

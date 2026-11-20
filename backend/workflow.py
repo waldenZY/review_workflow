@@ -119,16 +119,19 @@ def register(app, router, store):
 
     def bind(pid,dataset,groups,bindings):
         if len(bindings)!=len({b['group_id'] for b in bindings}) or {b['group_id'] for b in bindings}!={g['id'] for g in groups}:
-            raise ValueError('请为全部组分别选择字段方案，不可遗漏或重复。')
+            raise ValueError('请为全部组设置评测字段，不可遗漏或重复。')
         by_id={b['group_id']:b for b in bindings}
         available={f['path'] for f in dataset['fields']}
         for group in groups:
             b=by_id[group['id']]
-            mapping=store().get(pid,b['mapping_id'],b['mapping_version'],'mapping',True)
-            if mapping['dataset_id']!=dataset['id']:
-                raise ValueError('组「'+group['name']+'」的字段方案属于其他数据集，请重新选择。')
+            if b['evaluation_fields'] is not None:
+                mapping = {'evaluation_fields': b['evaluation_fields']}
+            else:
+                mapping = store().get(pid, b['mapping_id'], b['mapping_version'], 'mapping', True)
+                if mapping['dataset_id'] != dataset['id']:
+                    raise ValueError('组「' + group['name'] + '」的字段方案属于其他数据集，请重新选择。')
             if not set(mapping['evaluation_fields'])<=available:
-                raise ValueError('字段方案引用了当前材料中不存在的字段。')
+                raise ValueError('组「' + group['name'] + '」选中了当前数据集中不存在的字段。')
             for s in group['standards']:
                 if s['method']!='llm' and s['target_field'] not in mapping['evaluation_fields']:
                     raise ValueError('标准「'+s['name']+'」的程序作用字段未选中。')
@@ -151,9 +154,13 @@ def register(app, router, store):
             dataset=store().get(project_id,body.dataset_id,body.dataset_version,'dataset',True)
             groups=bind(project_id,dataset,resolve_plan(project_id,body.plan.model_dump()),[b.model_dump() for b in body.bindings])
             row=store().data_row(project_id,dataset['material_id'],body.row_id)
-            return {'groups':[{**g,'messages':group_messages(g,row),
-                'request':app.state.gateway.preview(group_messages(g,row),app.state.settings.current),
-                'model_required':any(s['method']=='llm' for s in g['standards'])} for g in groups], 'draft':True}
+            result = []
+            for group in groups:
+                model_required = any(standard['method'] == 'llm' for standard in group['standards'])
+                messages = group_messages(group, row) if model_required else []
+                result.append({**group, 'messages': messages, 'model_required': model_required,
+                               'request': app.state.gateway.preview(messages, app.state.settings.current) if model_required else None})
+            return {'groups': result, 'draft': True}
 
     @router.post('/standards/test')
     def test_standard(project_id:str,body:StandardTest):
@@ -230,7 +237,9 @@ def register(app, router, store):
         for key,kind in (('dataset','dataset'),('plan','execution_plan')):
             obj=snap[key];store().get(pid,obj['id'],obj['version'],kind,True)
         for g in snap['groups']:
-            obj=g['mapping'];store().get(pid,obj['id'],obj['version'],'mapping',True)
+            mapping = g['mapping']
+            if mapping.get('id'):
+                store().get(pid, mapping['id'], mapping['version'], 'mapping', True)
             for s in g['standards']:
                 store().get(pid,s['id'],s['version'],'standard',True)
 

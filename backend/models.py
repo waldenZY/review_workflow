@@ -76,8 +76,20 @@ class PlanSave(Input):
 
 class GroupInputBinding(Input):
     group_id: str
-    mapping_id: str
-    mapping_version: int = Field(ge=1)
+    evaluation_fields: list[str] | None = Field(default=None, min_length=1)
+    mapping_id: str | None = None
+    mapping_version: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode='after')
+    def check_input_source(self):
+        if self.evaluation_fields is not None:
+            if self.mapping_id is None and self.mapping_version is None:
+                if len(self.evaluation_fields) == len(set(self.evaluation_fields)):
+                    return self
+                raise ValueError('评测字段不可重复。')
+        elif self.mapping_id and self.mapping_version is not None:
+            return self
+        raise ValueError('请直接选择评测字段，或提供完整的旧字段方案引用。')
 
 
 class RunRequest(Input):

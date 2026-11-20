@@ -94,7 +94,7 @@ def references(value):
     elif kind == 'run':
         snap = value['snapshot']
         refs.extend((k, snap[key]['id']) for k, key in (('dataset','dataset'),('execution_plan','plan')))
-        refs.extend(('mapping', g['mapping']['id']) for g in snap['groups'])
+        refs.extend(('mapping', g['mapping']['id']) for g in snap['groups'] if g['mapping'].get('id'))
         refs.extend(('standard', s['id']) for g in snap['groups'] for s in g['standards'])
         if value.get('parent_run_id'):
             refs.append(('run', value['parent_run_id']))

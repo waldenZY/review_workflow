@@ -319,6 +319,10 @@ def register(app, router, store):
     def rounds(project_id:str,run_id:str):
         return {'rounds':store().rounds(project_id,run_id)}
 
+    @router.get('/runs/{run_id}/statistics')
+    def statistics(project_id: str, run_id: str):
+        return store().run_statistics(project_id, run_id)
+
     @router.get('/runs/{run_id}/records')
     def records(project_id:str,run_id:str,offset:int=0,limit:int=20,status_group:str='all',error_stage:str='',group_id:str=''):
         if offset<0 or limit not in (10,20,50): raise ValueError('无效分页参数。')

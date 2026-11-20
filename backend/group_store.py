@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from .storage_schema import attempt_summary, counts, run_summary, save_references
+from .run_statistics import summarize_run
 
 
 def now():
@@ -235,6 +236,19 @@ class GroupRuns:
                 attempt.setdefault('timing',{}).update(timing)
                 attempts.append(attempt)
         return {**self.data_row(pid,run['snapshot']['dataset']['material_id'],row_id),'status':row[0],'groups':groups,'attempts':attempts}
+
+    def run_statistics(self, pid, rid):
+        with self.read() as db:
+            row = db.execute('''SELECT body,rows_selected,rows_succeeded,selected,succeeded,failed,running,pending
+                                FROM runs WHERE project_id=? AND id=?''', (pid, rid)).fetchone()
+            if not row:
+                raise KeyError('运行不属于当前项目，或已删除。')
+            body, rows_selected, rows_succeeded, *progress = row
+            tasks = db.execute('''SELECT group_id,status,CASE WHEN status='completed' THEN summary END
+                                  FROM group_tasks WHERE project_id=? AND run_id=?''', (pid, rid))
+            return {**summarize_run(json.loads(body), tasks, rows_selected),
+                    'row_progress': {'selected': rows_selected, 'succeeded': rows_succeeded},
+                    'progress': dict(zip(('selected', 'succeeded', 'failed', 'running', 'pending'), progress))}
 
     def export_batches(self,pid,rid,batch=100):
         run=self.get_run(pid,rid); after=-1

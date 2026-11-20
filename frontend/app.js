@@ -25,7 +25,7 @@
       standard: blankStandard(), standardDirty: false, plan: null, planDirty: false, fields: emptyFields(),
       groupChecks: [], templateCheck: null, activeView: null, history: [], historyOffset: 0,
       historyTotal: 0, historyStatus: '', historyDataset: '', selectionMode: 'selected',
-      parentRun: null, includeRaw: false, exportFields: null, defaults: null
+      parentRun: null, rerunRows: null, defaults: null
     });
     ++templateSeq; ++previewSeq; ++rowSeq;
     clearTimeout(templateTimer); clearTimeout(previewTimer);
@@ -38,8 +38,8 @@
   const badge=v=>`<span class="badge ${/^[a-z_]+$/.test(v||'')?v:''}">${esc(labels[v]||v)}</span>`;
   const json=v=>`<pre class="json-view">${esc(pretty(v))}</pre>`;
   const field=(label,control,hint='')=>`<label class="field"><span>${esc(label)}</span>${control}${hint?`<small>${esc(hint)}</small>`:''}</label>`;
-  const input=(bind,v,type='text',attrs='')=>`<input type="${type}" data-bind="${esc(bind)}" value="${esc(v)}" ${attrs}>`;
-  const area = (bind, value, rows = 5, hint = '') => `<textarea data-bind="${esc(bind)}" rows="${rows}" placeholder="${esc(hint)}">${esc(value)}</textarea>`;
+  const input=(bind,v,type='text',attrs='')=>`<input type="${type}" data-bind="${esc(bind)}" value="${esc(v)}" ${s.busy ? 'readonly' : ''} ${attrs}>`;
+  const area = (bind, value, rows = 5, hint = '') => `<textarea data-bind="${esc(bind)}" rows="${rows}" placeholder="${esc(hint)}" ${s.busy ? 'readonly' : ''}>${esc(value)}</textarea>`;
   function select(bind, values, value, hint = '请选择') {
     const hasSelection = values.some(([option]) => String(option) === String(value));
     return `<select data-bind="${esc(bind)}"${hasSelection ? '' : ' class="select-placeholder"'}${s.busy ? ' disabled' : ''}>
@@ -56,10 +56,10 @@
   const cell=v=>{const text=typeof v==='string'?v:JSON.stringify(v);return `<details class="result-cell"><summary>${esc(text?.slice(0,120)??'—')}${text?.length>120?'…':''}</summary><pre>${esc(text??'—')}</pre></details>`;};
   const ptr=(v,path)=>{for(const k of path.slice(1).split('/'))v=v?.[k.replaceAll('~1','/').replaceAll('~0','~')];return v;};
   const dirty=()=>s.standardDirty||s.planDirty;
-  const allowDiscard=()=>!dirty()||confirm('当前有未保存草稿，确定切换并放弃改动？');
+  const allowDiscard=(kind)=>!(kind ? s[kind + 'Dirty'] : dirty())||confirm('当前有未保存草稿，确定切换并放弃改动？');
   const options=items=>items.map(v=>[v.id,`${v.name||v.title||v.filename}${v.version?' · v'+v.version:''}${v.archived_at?'（归档）':''}`]);
-  async function api(path,method='GET',body){const abort=method==='GET'?new AbortController():null,timer=abort?setTimeout(()=>abort.abort(),15000):null;try{const r=await fetch('/api/v1'+path,{method,signal:abort?.signal,headers:body===undefined||body instanceof FormData?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:body instanceof FormData?body:JSON.stringify(body)});const v=await r.json();if(!r.ok)throw new Error((typeof v.detail==='string'?v.detail:pretty(v.detail||v))+(v.references?'\n引用：'+pretty(v.references):''));return v;}finally{clearTimeout(timer);}}
-  async function papi(path,method='GET',body){const epoch=s.epoch,pid=s.project?.id;if(!pid)throw new Error('先打开项目。');const value=await api(`/projects/${pid}${path}`,method,body);if(epoch!==s.epoch)throw Object.assign(new Error('项目已切换'),{stale:true});return value;}
+  async function api(path,method='GET',body,timeout=15000){const abort=method==='GET'?new AbortController():null,timer=abort?setTimeout(()=>abort.abort(),timeout):null;try{const r=await fetch('/api/v1'+path,{method,signal:abort?.signal,headers:body===undefined||body instanceof FormData?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:body instanceof FormData?body:JSON.stringify(body)});const v=await r.json();if(!r.ok)throw new Error((typeof v.detail==='string'?v.detail:pretty(v.detail||v))+(v.references?'\n引用：'+pretty(v.references):''));return v;}finally{clearTimeout(timer);}}
+  async function papi(path,method='GET',body,timeout){const epoch=s.epoch,pid=s.project?.id;if(!pid)throw new Error('先打开项目。');const value=await api(`/projects/${pid}${path}`,method,body,timeout);if(epoch!==s.epoch)throw Object.assign(new Error('项目已切换'),{stale:true});return value;}
   async function action(task) {
     if (s.busy) return;
     clearTimeout(noticeTimer);
@@ -80,11 +80,53 @@
   }
   async function catalog(){const c=await papi('/catalog');s.catalog=c;s.project=c.project;}
   async function openProject(pid){++s.epoch;s.modal=null;reset();s.project=s.projects.find(p=>p.id===pid)||null;if(!s.project)return;localStorage.setItem('eval.v1_1.r4.project',pid);await catalog();s.defaults=await papi('/execution-plans/defaults');for(const [kind,items] of [['dataset',s.catalog.datasets],['standard',s.catalog.standards],['plan',s.catalog.plans]]){const old=recalled(kind),item=items.find(v=>v.id===old?.id)||items[0];if(!item)continue;const v=await papi(`/entities/${item.id}?version=${old?.id===item.id?old.version:item.version}`);if(kind==='dataset')await setDataset(v);if(kind==='standard')await setStandard(v);if(kind==='plan')await setPlan(v);}s.page=1;}
-  async function setDataset(v){s.dataset=v;s.offset=0;s.selected=[];s.parentRun=null;s.fields=emptyFields();remember('dataset',v);await loadRows();}
-  async function loadRows(){if(!s.dataset)return;const seq=++rowSeq,ds=s.dataset;const v=await papi(`/datasets/${ds.id}/rows?version=${ds.version}&offset=${s.offset}&limit=${s.size}`);if(seq===rowSeq)s.rows=v.rows;}
+  function clearRerun() {
+    s.parentRun = null;
+    s.rerunRows = null;
+  }
+  function clearDataset() {
+    ++rowSeq;
+    Object.assign(s, { dataset: null, rows: [], offset: 0, selected: [], fields: emptyFields(), selectionMode: 'selected' });
+    clearRerun();
+  }
+  function fetchRows(dataset, offset, size) {
+    return papi(`/datasets/${dataset.id}/rows?version=${dataset.version}&offset=${offset}&limit=${size}`);
+  }
+  async function setDataset(dataset) {
+    const { rows } = await fetchRows(dataset, 0, s.size);
+    clearDataset();
+    s.dataset = dataset;
+    s.rows = rows;
+    remember('dataset', dataset);
+  }
+  async function loadRows(offset = s.offset, size = s.size) {
+    if (!s.dataset) return;
+    const seq = ++rowSeq;
+    const { rows } = await fetchRows(s.dataset, offset, size);
+    if (seq === rowSeq) Object.assign(s, { rows, offset, size });
+  }
   async function loadVersions(v){s.versions[v.id]=await papi(`/entities/${v.id}/versions`);}
   async function setStandard(v){s.standard=clone(v);s.standardDirty=false;remember('standard',v);await loadVersions(v);scheduleTemplate();}
   const newPlan=()=>({title:'',system_template:'',user_template:'',groups:[]});
+  function clearStandard() {
+    s.standard = blankStandard();
+    s.standardDirty = false;
+    scheduleTemplate();
+  }
+  function clearPlan() {
+    s.plan = newPlan();
+    s.planDirty = false;
+    s.fields.groups = {};
+    s.addStandard = '';
+    schedulePlan();
+  }
+  function forgetSelection(kind, id) {
+    if (s[kind]?.id !== id) return;
+    localStorage.removeItem(key(kind));
+    if (kind === 'dataset') clearDataset();
+    if (kind === 'standard') clearStandard();
+    if (kind === 'plan') clearPlan();
+  }
   const groupName = index => `第 ${index + 1} 组`;
   async function setPlan(v){s.plan=clone(v);s.planDirty=false;s.fields.groups={};remember('plan',v);await loadVersions(v);for(const ref of v.groups.flatMap(g=>g.standards))s.versions[ref.standard_id]=await papi(`/standards/${ref.standard_id}/versions`);schedulePlan();}
   const standardBody=()=>Object.fromEntries(['id','name','description','method','output_template','target_field','rule_schema'].filter(k=>s.standard[k]!==undefined).map(k=>[k,s.standard[k]]));
@@ -107,11 +149,13 @@
     s.projects = result.projects;
   }
 
+  const selectableRow = rowId => !s.rerunRows || s.rerunRows.has(rowId);
+
   let projectDialogOpener = null;
 
   function closeModal() {
+    if (s.busy) return;
     if (s.modal?.opener) {
-      if (s.busy) return;
       projectDialogOpener = s.modal.opener;
     }
     const position = s.modal?.cellPosition;
@@ -208,7 +252,7 @@
     const columns = s.dataset?.original_columns || [];
     const headings = columns.length ? columns.map(column => `<th>${esc(column)}</th>`).join('') : '<th>原始字段</th>';
     const rows = s.rows.map(row => `<tr>
-      ${selectRows ? `<td><input aria-label="选择源行 ${row.source_row}" type="checkbox" data-row="${esc(row.row_id)}" ${s.selected.includes(row.row_id) ? 'checked' : ''} ${s.busy ? 'disabled' : ''}></td>` : ''}
+      ${selectRows ? `<td><input aria-label="选择源行 ${row.source_row}" type="checkbox" data-row="${esc(row.row_id)}" ${s.selected.includes(row.row_id) ? 'checked' : ''} ${s.busy || !selectableRow(row.row_id) ? 'disabled' : ''}${selectableRow(row.row_id) ? '' : ' title="该行不在原运行的样本范围内"'}></td>` : ''}
       <td>${row.source_row}</td>
       ${columns.map((column, index) => {
         if (!Object.hasOwn(row.original, column)) return '<td><span class="muted">—</span></td>';
@@ -386,13 +430,17 @@
     if (!s.project) return '创建或打开项目后可执行。';
     if (s.project.archived_at) return '恢复项目后可执行。';
     if (!s.dataset) return '请选择数据集。';
+    if (!s.catalog.datasets.some(dataset => dataset.id === s.dataset.id)) return '此数据集已归档或不可用。请先恢复数据集，或重新选择。';
+    if (!s.dataset.fields.length) return '这个数据集没有可用于评测的字段。';
     if (!s.plan?.id || s.planDirty) return '请先保存批跑方案。';
+    if (!s.catalog.plans.some(plan => plan.id === s.plan.id)) return '此方案已归档或不可用。请先恢复方案，或重新选择。';
+    const unavailable = s.plan.groups.flatMap(group => group.standards).find(ref => !selectedStandard(ref));
+    if (unavailable) return '方案引用的标准已归档或不可用。请先恢复标准，或更新方案。';
     const problem = fieldProblem(s.fields);
     if (problem) return problem;
     if (s.plan.groups.some(group => group.standards.some(ref => pinnedStandard(ref)?.method === 'llm')) && !s.llm.configured) {
       return '请先在模型设置中启用模型。';
     }
-    if (mode === 'batch' && s.parentRun && s.selectionMode === 'all') return '历史复测请使用原运行的记录范围。';
     if ((mode === 'trial' || s.selectionMode === 'selected') && !s.selected.length) return '请勾选至少一条样本。';
     return '';
   }
@@ -414,10 +462,10 @@
       ${fieldPicker(s.dataset, s.fields, 'fields')}
     `) + panel('选择记录', '试跑只执行第一条选中记录。', `
       <div class="toolbar">
-        ${btn('select-page', '选择本页', !s.rows.length)}
+        ${btn('select-page', '选择本页', !s.rows.some(row => selectableRow(row.row_id)))}
         ${btn('select-clear', '清空选择', !s.selected.length)}
         <small>已选 ${s.selected.length} 条</small>
-        ${select('selectionMode', [['selected', '仅所选记录'], ['all', '整个数据集']], s.selectionMode)}
+        ${s.parentRun ? `<small>复测限于原运行的样本。</small>${btn('rerun-exit', '退出复测')}` : select('selectionMode', [['selected', '仅所选记录'], ['all', '整个数据集']], s.selectionMode)}
       </div>
       ${dataTable(true)}
       <div class="toolbar editor-actions">
@@ -429,8 +477,124 @@
   }
   function resultTable(v){const gs=v.run.snapshot.groups,fs=v.run.snapshot.output_fields,ncols=g=>1+fs.filter(f=>f.group_id===g.id).length+(g.standards.some(c=>c.method!=='llm')?1:0);let head=`<tr><th rowspan="3">源行</th><th rowspan="3">行状态／详情</th>${gs.map(g=>`<th colspan="${ncols(g)}">${esc(g.name)}</th>`).join('')}</tr><tr>`;for(const g of gs){head+='<th rowspan="2">组状态</th>';for(const c of g.standards.filter(c=>c.method==='llm'))head+=`<th colspan="${fs.filter(f=>f.standard_id===c.id).length}">${esc(c.name)} · v${c.version}</th>`;if(g.standards.some(c=>c.method!=='llm'))head+='<th rowspan="2">程序规则</th>';}head+='</tr><tr>'+gs.flatMap(g=>fs.filter(f=>f.group_id===g.id).map(f=>`<th>${esc(f.name)}</th>`)).join('')+'</tr>';
     return table(`<table class="results-table"><thead>${head}</thead><tbody>${v.records.map(row=>`<tr><td>${row.source_row}</td><td>${badge(row.status)}${btn('record-detail','详情',false,`data-run="${v.run.id}" data-row="${esc(row.row_id)}"`)}</td>${gs.map(g=>{const r=row.groups.find(x=>x.group_id===g.id);return `<td>${badge(r?.status||'not_run')}<small>自动 ${r?.auto_retry_count||0}/3 · 尝试 ${r?.attempt_count||0}</small>${r?.auto_retry_count>=3&&r.status!=='completed'?'<p class="message warning">自动额度已用尽，等待人工处理。</p>':''}${r?.previous_attempt?'<small>上次尝试已保存；本轮尚未成功。</small>':''}${r?.error?cell(r.error):''}</td>`+fs.filter(f=>f.group_id===g.id).map(f=>`<td>${cell(ptr(r?.output,f.path))}</td>`).join('')+(g.standards.some(c=>c.method!=='llm')?`<td>${(r?.criteria||[]).map(c=>`<p>${esc(c.name)}：${c.verdict==='pass'?'通过':'不通过'}</p>`).join('')||'—'}</td>`:'');}).join('')}</tr>`).join('')||'<tr><td>暂无匹配记录</td></tr>'}</tbody></table>`);}
-  function runView(v){const r=v.run,g=r.progress,rows=r.row_progress||{};return panel(r.mode==='trial'?'分组试跑结果':'批跑结果',`${r.created_at} · ${r.dataset_name}`,`<div class="context-grid"><span>状态 ${badge(r.status)}</span><span>完整成功 <strong>${rows.succeeded||0}/${rows.selected||0} 条数据</strong></span><span>组任务成功 <strong>${g.succeeded}/${g.selected}</strong></span><span>异常 ${g.failed} · 执行中 ${g.running} · 未执行 ${g.pending}</span></div>${r.error?`<p class="message error">${esc(r.error)}</p>`:''}<p class="muted">每行每组最多追加 3 次自动重试；人工重试或服务重启均不重置额度。</p><div class="toolbar">${btn('run-refresh','刷新结果',false,`data-run="${r.id}"`)}${btn('run-cancel','取消任务',!active(r.status),`data-run="${r.id}"`)}${btn('run-retry','原配置失败重试',active(r.status)||!r.retryable,`data-run="${r.id}"`)}${btn('run-clone','按原配置新建运行',active(r.status),`data-run="${r.id}"`)}${btn('run-restore','载入编辑',active(r.status),`data-run="${r.id}"`)}${btn('run-config','完整快照',false,`data-run="${r.id}"`)}${btn('run-rounds','轮次记录',false,`data-run="${r.id}"`)}</div><div class="toolbar">${field('结果筛选',select('result.filter',[['all','全部'],['errors','有失败组'],['pending','有未执行组']],v.filter))}${field('执行组',select('result.group',[['','全部组'],...r.snapshot.groups.map(g=>[g.id,g.name])],v.group))}${field('异常阶段',select('result.stage',[['','全部阶段'],['call_failed','调用'],['parse_failed','JSON 解析'],['schema_failed','结构校验'],['interrupted','中断'],['scheduler_failed','调度']],v.stage))}</div>`+`<div class="toolbar">${btn('export-jsonl','导出 JSONL',active(r.status),`data-run="${r.id}"`)}${btn('export-xlsx','导出 XLSX',active(r.status),`data-run="${r.id}"`)}${check('includeRaw',s.includeRaw,'包含全部尝试的请求及原始响应')}</div>`+details('选择导出的原始列（各组使用列必保留）',r.snapshot.dataset.original_columns.map(k=>check('exportField.'+k,(s.exportFields||r.snapshot.dataset.original_columns).includes(k),k)).join(''))+'<p class="muted">导出覆盖整个原始数据集；保留未选中、失败和取消后未执行的记录。</p>'+resultTable(v)+pager('results',v.offset,v.total,v.size));}
 
+  function resultDetails(view) {
+    const run = view.run;
+    const attrs = `data-run="${esc(run.id)}"`;
+    return `<div class="toolbar">
+      ${field('结果筛选', select('result.filter', [['all','全部'],['errors','有失败组'],['pending','有未执行组']], view.filter))}
+      ${field('执行组', select('result.group', [['','全部组'], ...run.snapshot.groups.map(group => [group.id, group.name])], view.group))}
+      ${field('异常阶段', select('result.stage', [['','全部阶段'],['call_failed','调用'],['parse_failed','JSON 解析'],['schema_failed','结构校验'],['interrupted','中断'],['scheduler_failed','调度']], view.stage))}
+    </div>
+    <div class="toolbar">
+      ${btn('export-xlsx', '导出 XLSX', active(run.status), attrs)}
+      ${btn('export-jsonl', '导出 JSONL', active(run.status), attrs)}
+      ${check('includeRaw', view.includeRaw, '包含全部尝试的请求及原始响应')}
+    </div>
+    ${details('选择导出的原始列（各组使用列必保留）', run.snapshot.dataset.original_columns.map(column =>
+      check('exportField.' + column, (view.exportFields || run.snapshot.dataset.original_columns).includes(column), column)).join(''))}
+    <p class="muted">导出覆盖整个原始数据集；保留未选中、失败和取消后未执行的记录。</p>
+    ${resultTable(view)}
+    ${pager('results', view.offset, view.total, view.size)}`;
+  }
+
+  const percent = (count, total) => total ? (count / total * 100).toFixed(1) + '%' : '—';
+  const statisticNumber = value => {
+    if (value === null) return '—';
+    if (typeof value === 'string') return value;
+    if (value !== 0 && (Math.abs(value) >= 1e9 || Math.abs(value) < 0.0001)) return value.toExponential(5);
+    return value.toLocaleString('zh-CN', { maximumSignificantDigits: 6 });
+  };
+
+  function statisticField(field) {
+    let type, body;
+    if (field.options) {
+      type = field.rule === 'multichoice' ? '多选' : '单选';
+      const counts = field.options.map(option => `
+        <li class="stat-distribution-row">
+          <span class="stat-option">${esc(option.value)}</span>
+          <meter min="0" max="${field.count || 1}" value="${option.count}" aria-label="${esc(option.value)}的占比"></meter>
+          <span class="stat-option-count">${option.count} 条 · ${percent(option.count, field.count)}</span>
+        </li>`).join('');
+      body = `<ul class="stat-distribution">${counts}</ul>`;
+      if (field.rule === 'multichoice') {
+        body += `<p class="muted">未选标签 ${field.empty} 条。一条记录可以命中多个标签。</p>`;
+      }
+    } else if (field.type === 'number') {
+      type = '数值';
+      body = `<dl class="stat-numbers">${[['平均', field.mean], ['最低', field.min], ['最高', field.max]].map(([label, value]) =>
+        `<div><dt>${label}</dt><dd>${esc(statisticNumber(value))}</dd></div>`).join('')}</dl>`;
+    } else {
+      type = '自由文本';
+      body = `<dl class="stat-numbers"><div><dt>有内容</dt><dd>${field.filled} 条</dd></div><div><dt>空白</dt><dd>${field.empty} 条</dd></div></dl>`;
+    }
+    return `<section class="stat-field">
+      <header><strong>${esc(field.name)}</strong><small>${type} · ${field.count} 条</small></header>
+      ${body}
+    </section>`;
+  }
+
+  function statisticsView(statistics) {
+    const groups = statistics.groups.map((group, index) => {
+      const standards = new Map();
+      for (const field of group.fields) {
+        if (!standards.has(field.standard_name)) standards.set(field.standard_name, []);
+        standards.get(field.standard_name).push(field);
+      }
+      const coverage = [
+        [group.fields.length ? '有效结果' : '已完成', (group.fields.length ? group.valid : group.completed) + ' / ' + group.selected],
+        ['执行失败', group.failed], ['未执行', group.pending]
+      ];
+      if (group.running) coverage.push(['执行中', group.running]);
+      if (group.interrupted) coverage.push(['中断', group.interrupted]);
+      return `<details class="stats-group" ${index === 0 ? 'open' : ''}>
+        <summary><strong>${esc(group.name)}</strong></summary>
+        <dl class="stats-coverage">${coverage.map(([label, amount]) => `<div><dt>${label}</dt><dd>${amount}</dd></div>`).join('')}</dl>
+        ${group.fields.length ? [...standards].map(([name, fields]) => `<section class="stats-standard">
+          <h3>${esc(name)}</h3><div class="stats-fields">${fields.map(statisticField).join('')}</div>
+        </section>`).join('') : '<p class="muted">本组只有程序规则，明细中可查看逐条结果。</p>'}
+      </details>`;
+    }).join('');
+    return `<div class="stats-view">
+      <div class="stats-intro">
+        <p>统计覆盖本次选中的 <strong>${statistics.selected}</strong> 条数据。各字段以本组的有效样本为分母。</p>
+        ${btn('run-statistics', '刷新统计', false, `data-run="${esc(statistics.run_id)}"`)}
+      </div>
+      ${active(statistics.status) ? '<p class="muted">运行尚未结束，当前显示最近一次刷新的结果。</p>' : ''}
+      ${groups}
+    </div>`;
+  }
+
+  function runView(view) {
+    const run = view.run, progress = run.progress, rows = run.row_progress;
+    const attrs = `data-run="${esc(run.id)}"`;
+    const running = active(run.status);
+    const readOnly = ro() || !!run.archived_at;
+    const showStatistics = view.tab === 'statistics';
+    return panel(run.mode === 'trial' ? '分组试跑结果' : '批跑结果', `${run.created_at} · ${run.dataset_name}`, `
+      <div class="context-grid">
+        <span>状态 ${badge(run.status)}</span>
+        <span>完整成功 <strong>${rows?.succeeded || 0}/${rows?.selected || 0} 条数据</strong></span>
+        <span>组任务成功 <strong>${progress.succeeded}/${progress.selected}</strong></span>
+        <span>异常 ${progress.failed} · 执行中 ${progress.running} · 未执行 ${progress.pending}</span>
+      </div>
+      ${run.error ? `<p class="message error">${esc(run.error)}</p>` : ''}
+      <p class="muted">${run.mode === 'trial' ? '试跑不会自动重试。' : '每行每组最多追加 3 次自动重试；人工重试或服务重启均不重置额度。'}</p>
+      <div class="toolbar">
+        ${btn('run-refresh', '刷新结果', false, attrs)}
+        ${btn('run-cancel', '取消任务', readOnly || !running, attrs)}
+        ${btn('run-retry', '原配置失败重试', readOnly || running || !run.retryable, attrs)}
+        ${btn('run-clone', '按原配置新建运行', readOnly || running, attrs)}
+        ${btn('run-restore', '载入编辑', readOnly || running, attrs)}
+        ${btn('run-config', '完整快照', false, attrs)}
+        ${btn('run-rounds', '轮次记录', false, attrs)}
+      </div>
+      <div class="result-tabs" role="group" aria-label="结果视图">
+        ${btn('run-details', '明细', false, attrs + ` aria-pressed="${!showStatistics}"`)}
+        ${btn('run-statistics', '统计', false, attrs + ` aria-pressed="${showStatistics}"`)}
+      </div>
+      ${showStatistics ? statisticsView(view.statistics) : resultDetails(view)}`);
+  }
   function historyPage() {
     const statuses = ['completed', 'completed_with_errors', 'cancelled', 'interrupted', 'queued', 'running', 'failed'];
     const records = s.history.map(run => {
@@ -445,7 +609,7 @@
           ${btn('history-detail', '详情', false, attrs)}
           ${btn('history-export-xlsx', '导出 XLSX', active(run.status), exportAttrs)}
           ${btn('history-export-jsonl', '导出 JSONL', active(run.status), exportAttrs)}
-          ${btn('history-delete', '删除', active(run.status), attrs)}
+          ${btn('history-delete', '删除', ro() || active(run.status), attrs)}
         </div></td>
       </tr>`;
     }).join('');
@@ -461,7 +625,7 @@
   }
   function modelForm(p){s.profileId=p?.id||null;s.profileName=p?.name||'';s.connection=clone({api_url:'',api_key:'',model:'',max_tokens:4096,timeout:120,stream:false,enable_thinking:false,skip_special_tokens:false,...(p?.settings||s.llm.settings||{})});s.connection.api_key='';s.execution=clone(p?.execution||{batch_concurrency:1});}
   function modelPage(){if(!s.connection)modelForm(s.llm.profiles.find(p=>p.id===s.llm.active_profile_id));return panel('全局模型设置','后续调用共用当前配置；已提交运行保持原参数。测试另有 1 个独立通道。',`<p>${esc(s.llm.message||'')}</p><div class="toolbar">${field('命名配置',select('profile',options(s.llm.profiles),s.profileId||''))}${btn('model-new','新建配置')}${btn('model-copy','复制为新配置')}${btn('model-save','保存',false,'',true)}${btn('model-activate','启用当前配置',!s.profileId)}${btn('model-test','测试连接')}${btn('model-delete','删除配置',!s.profileId)}${btn('model-clear','清空密钥',!s.profileId)}</div>`+field('配置名称',input('profileName',s.profileName))+['api_url','api_key','model','max_tokens','timeout'].map(k=>field({api_url:'完整请求 URL',api_key:'API Key（留空保留已存密钥）',model:'模型名称',max_tokens:'最大输出 Token',timeout:'超时（秒）'}[k],input('connection.'+k,s.connection[k]??'',k==='api_key'?'password':['max_tokens','timeout'].includes(k)?'number':'text'))).join('')+['stream','enable_thinking','skip_special_tokens'].map(k=>check('connection.'+k,s.connection[k],k)).join('')+field('批跑并发上限（1～32）',input('execution.batch_concurrency',s.execution.batch_concurrency,'number','min="1" max="32"')));}
-  function managerBody(){const m=s.modal;return '<p>归档从日常选择中隐藏，可恢复；有引用的对象不可删除。</p>'+m.items.map(v=>`<article class="criterion-card"><strong>${esc(v.name||v.title||v.filename||v.id)}</strong> · v${v.version}${v.archived_at?' · 归档':''}<div class="toolbar">${btn('manage-refs','查看引用',false,`data-id="${v.id}"`)}${btn('manage-archive',v.archived_at?'恢复':'归档',false,`data-id="${v.id}" data-restore="${!!v.archived_at}"`)}${btn('manage-delete','删除',false,`data-id="${v.id}"`)}</div>${m.refId===v.id?json(m.references):''}</article>`).join('');}
+  function managerBody(){const m=s.modal;return '<p>归档从日常选择中隐藏，可恢复；有引用的对象不可删除。</p>'+m.items.map(v=>`<article class="criterion-card"><strong>${esc(v.name||v.title||v.filename||v.id)}</strong> · v${v.version}${v.archived_at?' · 归档':''}<div class="toolbar">${btn('manage-refs','查看引用',false,`data-id="${v.id}"`)}${btn('manage-archive',v.archived_at?'恢复':'归档',ro(),`data-id="${v.id}" data-restore="${!!v.archived_at}"`)}${btn('manage-delete','删除',ro(),`data-id="${v.id}"`)}</div>${m.refId===v.id?json(m.references):''}</article>`).join('');}
   function projectDialog(modal) {
     const deleting = modal.type === 'projectDelete';
     const { scope, form, title } = modal;
@@ -605,15 +769,31 @@
     if (modal.type === 'refUpdate') body = `<p>引用 v${modal.before.version} → v${modal.after.version}。采用后请保存方案。</p><div class="messages-grid">${json(modal.before)}${json(modal.after)}</div>${btn('ref-apply','采用此版本',false,'',true)}`;
     return `<div class="workspace-overlay"><section class="workspace-dialog${modal.type === 'dataValue' ? ' data-value-dialog' : ''}" role="dialog" aria-modal="true" aria-labelledby="dialog-title" tabindex="-1">
       <header class="workspace-dialog-heading"><h2 id="dialog-title">${esc(modal.title)}</h2><button class="button" data-action="modal-close">关闭</button></header>
-      <div class="workspace-dialog-body">${s.error ? `<p role="alert" class="message error">${esc(s.error)}</p>` : ''}${modal.type === 'run' && s.notice ? `<p data-notice role="status" class="message success">${esc(s.notice)}</p>` : ''}${body}</div>
+      <div class="workspace-dialog-body">${s.error ? `<p role="alert" class="message error dialog-error preserve-lines">${esc(s.error)}</p>` : ''}${modal.type === 'run' && s.notice ? `<p data-notice role="status" class="message success">${esc(s.notice)}</p>` : ''}${body}</div>
     </section></div>`;
   }
   function scrollbars(){root.querySelectorAll('.scroll-table').forEach(el=>{const body=el.querySelector('.table-scroll'),top=el.querySelector('.table-scroll-top');top.hidden=body.scrollWidth<=body.clientWidth;top.firstElementChild.style.width=body.scrollWidth+'px';body.onscroll=()=>{top.scrollLeft=body.scrollLeft;};top.onscroll=()=>{body.scrollLeft=top.scrollLeft;};});}
+  let renderedPage, renderedEpoch, renderedModal, renderedActiveView;
   function render() {
     const focused = document.activeElement;
     const binding = focused?.dataset.bind;
+    const action = focused?.dataset.action;
     const start = focused?.selectionStart, end = focused?.selectionEnd;
-    const opened = [...root.querySelectorAll('details[open]')].map(el => el.querySelector('summary')?.textContent);
+    const samePage = renderedPage === s.page && renderedEpoch === s.epoch;
+    const sameModal = !!s.modal && renderedModal === s.modal;
+    const oldPage = samePage && root.querySelector('.app-shell');
+    const oldDialog = sameModal && root.querySelector('.workspace-dialog-body');
+    const saveLayout = container => container && {
+      top:container.scrollTop,
+      tables:[...container.querySelectorAll('.table-scroll')].map(el => el.scrollLeft),
+      open:new Set([...container.querySelectorAll('details[open]')].map(el => el.querySelector('summary')?.textContent))
+    };
+    const pageLayout = saveLayout(oldPage), modalLayout = saveLayout(oldDialog);
+    const sameResult = renderedActiveView === s.activeView;
+    renderedPage = s.page;
+    renderedEpoch = s.epoch;
+    renderedModal = s.modal;
+    renderedActiveView = s.activeView;
     const page = [projectsPage, dataPage, standardPage, planPage, executionPage, historyPage, modelPage][s.page];
     const projectOptions = s.projects.some(project => project.id === s.project?.id) || !s.project
       ? s.projects : [s.project, ...s.projects];
@@ -623,7 +803,7 @@
     root.innerHTML = `<div class="app-shell" ${s.modal ? 'inert' : ''}>
       <aside class="sidebar">
         <div class="brand">Eval Studio</div>
-        <nav aria-label="工作区">${titles.map((title, index) => `<button class="nav-item ${s.page === index ? 'active' : ''}" data-page="${index}" ${s.page === index ? 'aria-current="page"' : ''}>${title}</button>`).join('')}</nav>
+        <nav aria-label="工作区">${titles.map((title, index) => `<button class="nav-item ${s.page === index ? 'active' : ''}" data-page="${index}" ${s.page === index ? 'aria-current="page"' : ''} ${s.busy ? 'disabled' : ''}>${title}</button>`).join('')}</nav>
         <div class="sidebar-note"><a href="/help/tutorial" target="_blank">使用教程</a> · <a href="/help/deployment" target="_blank">部署说明</a></div>
       </aside>
       <div class="main-shell">
@@ -634,7 +814,9 @@
         <main>
           <header class="page-heading"><div><h1>${titles[s.page]}</h1>${subtitle ? `<p>${esc(subtitle)}</p>` : ''}</div></header>
           ${s.busy && !s.modal ? '<p class="muted" role="status">正在处理…</p>' : ''}
-          ${s.error && !s.modal ? `<p role="alert" class="message error preserve-lines">${esc(s.error)}</p>` : ''}
+          ${s.error && !s.modal ? `<div class="message error action-error">
+            <p role="alert" class="preserve-lines">${esc(s.error)}</p>
+            <button class="button" data-action="dismiss-error">关闭提示</button></div>` : ''}
           ${s.notice && !s.modal ? `<p data-notice role="status" class="message success save-notice">${esc(s.notice)}</p>` : ''}
           ${blankWorkspace ? `<div class="blank-workspace"><span>空白草稿 · 打开或创建项目后可导入和保存</span>${btn('project-new', '新建项目')}</div>` : ''}
           ${s.page !== 5 || s.project ? page() : empty('请先打开项目。')}
@@ -643,25 +825,71 @@
     </div>${modalHTML()}`;
     document.body.classList.toggle('workspace-modal-open', !!s.modal);
     scrollbars();
-    for (const disclosure of root.querySelectorAll('details')) {
-      if (opened.includes(disclosure.querySelector('summary')?.textContent)) disclosure.open = true;
-    }
+    const restoreLayout = (container, layout, restoreResult=true) => {
+      if (!layout || !container) return;
+      for (const disclosure of container.querySelectorAll('details')) {
+        if (layout.open.has(disclosure.querySelector('summary')?.textContent)) disclosure.open = true;
+      }
+      container.querySelectorAll('.table-scroll').forEach((element, index) => {
+        if (restoreResult || !element.closest('#active-results')) element.scrollLeft = layout.tables[index] || 0;
+      });
+      container.scrollTop = layout.top;
+    };
+    restoreLayout(root.querySelector('.app-shell'), pageLayout, sameResult);
+    restoreLayout(root.querySelector('.workspace-dialog-body'), modalLayout);
     const dialog = root.querySelector('[role="dialog"]');
     if (s.modal?.type === 'dataValue') dialog.querySelector('textarea').value = s.modal.value;
-    const target = binding && [...(dialog || root).querySelectorAll('[data-bind]')].find(el => el.dataset.bind === binding);
+    const scope = dialog ? sameModal && dialog : samePage && !renderedModal && root;
+    const target = scope && (
+      (binding && [...scope.querySelectorAll('[data-bind]')].find(el => el.dataset.bind === binding)) ||
+      (action && [...scope.querySelectorAll('[data-action]:not(:disabled)')].find(el => el.dataset.action === action &&
+        el.dataset.run === focused.dataset.run && el.dataset.id === focused.dataset.id && el.dataset.row === focused.dataset.row))
+    );
     if (target) {
-      target.focus();
+      target.focus({preventScroll:true});
       if (start != null && target.setSelectionRange) target.setSelectionRange(start, end);
     } else if (dialog) {
-      dialog.focus();
+      dialog.focus({preventScroll:true});
     }
     focusProjectDialog();
   }
   function moveRef(sid,target){const from=s.plan.groups.find(g=>g.standards.some(r=>r.standard_id===sid)),ref=from.standards.find(r=>r.standard_id===sid);from.standards=from.standards.filter(r=>r!==ref);s.plan.groups.find(g=>g.id===target).standards.push(ref);s.plan.groups=s.plan.groups.filter(g=>g.standards.length);s.planDirty=true;schedulePlan();}
   function splitGroup(g){if(g.standards.length<2)return;const i=s.plan.groups.indexOf(g);const refs=g.standards;g.standards=refs.slice(0,1);s.plan.groups.splice(i+1,0,...refs.slice(1).map(r=>({id:uid(),standards:[r]})));s.planDirty=true;schedulePlan();}
-  async function loadHistory(){const v=await papi(`/run-history?offset=${s.historyOffset}&limit=20&status=${s.historyStatus}&dataset_id=${s.historyDataset}&include_archived=${!!s.historyArchived}`);s.history=v.items;s.historyTotal=v.total;}
+  async function loadHistory(offset=s.historyOffset, filters={}) {
+    const {historyStatus, historyDataset, historyArchived} = {...s, ...filters};
+    const fetchPage = start => papi(`/run-history?offset=${start}&limit=20&status=${historyStatus}&dataset_id=${historyDataset}&include_archived=${!!historyArchived}`);
+    let page = await fetchPage(offset);
+    if (offset && !page.items.length) {
+      offset = Math.max(0, Math.ceil(page.total / 20) - 1) * 20;
+      page = await fetchPage(offset);
+    }
+    Object.assign(s, filters, {history:page.items, historyTotal:page.total, historyOffset:offset});
+  }
   const view=()=>s.modal?.type==='run'?s.modal.view:s.activeView;
-  async function loadView(runId,target=null){const v=target||{offset:0,size:20,filter:'all',stage:'',group:'',records:[]};const seq=(v.seq||0)+1;v.seq=seq;const r=await papi('/runs/'+runId),p=await papi(`/runs/${runId}/records?offset=${v.offset}&limit=${v.size}&status_group=${v.filter}&error_stage=${v.stage}&group_id=${v.group}`);if(v.seq!==seq)return v;Object.assign(v,{run:r,records:p.records,total:p.total,offset:p.offset});return v;}
+  const visibleResult=()=>s.modal?.type==='run'?s.modal.view:!s.modal&&s.page===4?s.activeView:null;
+  async function loadView(runId, target=null, options={}) {
+    const v = target || {offset:0, size:20, filter:'all', stage:'', group:'', records:[], exportFields:null, includeRaw:false};
+    const seq = (v.seq || 0) + 1;
+    v.seq = seq;
+    const {offset, size, filter, stage, group} = {...v, ...options};
+    const query = new URLSearchParams({offset, limit:size, status_group:filter, error_stage:stage, group_id:group});
+    const run = await papi('/runs/'+runId);
+    const page = await papi(`/runs/${runId}/records?${query}`);
+    if (v.seq === seq) {
+      Object.assign(v, options, {run, records:page.records, total:page.total, offset:page.offset});
+      const historical = s.history.find(item => item.id === run.id);
+      if (historical) Object.assign(historical, {status:run.status, row_progress:run.row_progress});
+    }
+    return v;
+  }
+  async function loadStatistics(result) {
+    const statistics = await papi(`/runs/${result.run.id}/statistics`, 'GET', undefined, 60000);
+    const { status, progress, row_progress } = statistics;
+    ++result.seq;
+    result.statistics = statistics;
+    Object.assign(result.run, { status, progress, row_progress, retryable: progress.succeeded < progress.selected });
+    result.tab = 'statistics';
+  }
   async function startRun(mode) {
     const problem = executionProblem(mode);
     if (problem) throw new Error(problem);
@@ -724,9 +952,9 @@
       return;
     }
     if(name==='import'){const file=s.upload;if(!file)throw new Error('请选择文件。');if(file.size>100*1024*1024)throw new Error('文件超过 100 MiB。');const form=new FormData();form.append('file',file);form.append('sheet',s.sheet||'');form.append('header_row',s.header||1);const ds=await papi('/datasets/import','POST',form);await catalog();await setDataset(ds);s.upload=null;s.notice='导入完成。';return;}
-    if(name==='standard-new'){if(!allowDiscard())return;s.standard=blankStandard();s.standardDirty=false;scheduleTemplate();return;}
+    if(name==='standard-new'){if(allowDiscard('standard'))clearStandard();return;}
     if(name==='standard-save'||name==='standard-copy'){if(s.standard.method==='json_schema')s.standard.rule_schema=JSON.parse(s.standard.schemaText||pretty(s.standard.rule_schema));const body=standardBody();if(name==='standard-copy')delete body.id;const saved=await papi('/standards','POST',body);await setStandard(saved);await catalog();s.notice=`已保存标准「${saved.name}」· v${saved.version}`;return;}
-    if(name==='plan-new'){if(!allowDiscard())return;s.plan=newPlan();s.planDirty=false;s.fields.groups={};s.groupChecks=[];return;}
+    if(name==='plan-new'){if(allowDiscard('plan'))clearPlan();return;}
     if(name==='plan-save'||name==='plan-copy') {
       const body = planBody();
       if (name === 'plan-copy') delete body.id;
@@ -755,19 +983,35 @@
     if(name==='ref-remove'||name==='ref-split'){const g=s.plan.groups.find(g=>g.id===d.group),ref=g.standards.find(r=>r.standard_id===d.id);g.standards=g.standards.filter(r=>r!==ref);if(name==='ref-split')s.plan.groups.push({id:uid(),standards:[ref]});s.plan.groups=s.plan.groups.filter(g=>g.standards.length);s.planDirty=true;schedulePlan();return;}
     if(name==='ref-update'){const g=s.plan.groups.find(g=>g.id===d.group),ref=g.standards.find(r=>r.standard_id===d.id),before=await papi(`/standards/${d.id}?version=${ref.version}`),after=await papi('/standards/'+d.id);s.modal={type:'refUpdate',title:'更新引用版本',before,after,ref};return;}
     if(name==='ref-apply'){s.modal.ref.version=s.modal.after.version;s.modal=null;s.planDirty=true;schedulePlan();return;}
-    if(name==='select-page'){s.selected=[...new Set([...s.selected,...s.rows.map(r=>r.row_id)])];return;}
-    if(name==='select-clear'){s.selected=[];s.parentRun=null;return;}
+    if(name==='select-page'){s.selected=[...new Set([...s.selected,...s.rows.map(r=>r.row_id).filter(selectableRow)])];return;}
+    if(name==='select-clear'){s.selected=[];return;}
+    if(name==='rerun-exit'){clearRerun();s.notice='已退出历史复测，当前配置和勾选记录已保留。';return;}
     if (name === 'preview-open') { await openPreview(); return; }
     if (name === 'preview-render') { await renderRequestPreview(); return; }
     if(name==='trial'||name==='batch'){await startRun(name==='trial'?'trial':'batch');return;}
     if(name==='history-load'){await loadHistory();return;}
-    if(name==='history-detail'){s.exportFields=null;s.modal={type:'run',title:'运行详情',view:await loadView(d.id)};return;}
+    if(name==='history-detail'){s.modal={type:'run',title:'运行详情',view:await loadView(d.id)};return;}
     if(name==='history-delete'){if(!confirm('删除本次运行及其尝试和导出文件？'))return;await papi(`/history/run/${d.id}`,'DELETE',{confirm_id:d.id});await loadHistory();return;}
-    if(name==='run-refresh'){await loadView(d.run,view());return;}
-    if(name==='run-cancel'||name==='run-retry'){await papi(`/runs/${d.run}/${name==='run-cancel'?'cancel':'retry'}`,'POST',{});await loadView(d.run,view());return;}
+    if (name === 'run-statistics') {
+      const result = view();
+      await loadStatistics(result);
+      return;
+    }
+    if (name === 'run-details') {
+      const result = view();
+      if (result.tab === 'statistics') await loadView(d.run, result);
+      result.tab = 'details';
+      return;
+    }
+    if (name === 'run-refresh') {
+      const result = await loadView(d.run, view());
+      if (result.tab === 'statistics') await loadStatistics(result);
+      return;
+    }
+    if(name==='run-cancel'||name==='run-retry'){await papi(`/runs/${d.run}/${name==='run-cancel'?'cancel':'retry'}`,'POST',{});const result=await loadView(d.run,view());result.tab='details';return;}
     if(name==='run-clone'){const r=await papi(`/runs/${d.run}/clone`,'POST',{});s.modal=null;s.page=4;s.activeView=await loadView(r.id);return;}
     if (name === 'run-restore') {
-      if (!allowDiscard()) return;
+      if (!allowDiscard('plan')) return;
       const { snapshot, row_ids } = await papi(`/runs/${d.run}/configuration`);
       await setDataset(snapshot.dataset);
       await setPlan(snapshot.plan);
@@ -780,6 +1024,7 @@
       s.selected = row_ids;
       s.selectionMode = 'selected';
       s.parentRun = d.run;
+      s.rerunRows = new Set(row_ids);
       s.modal = null;
       s.page = 3;
       s.notice = '已载入历史方案和评测字段为草稿。';
@@ -792,16 +1037,41 @@
       return;
     }
     if (name.startsWith('export-')) {
+      const result = view();
       await exportRun(d.run, name.slice('export-'.length), {
-        original_fields: s.exportFields, include_raw_response: s.includeRaw
+        original_fields: result.exportFields, include_raw_response: result.includeRaw
       });
       return;
     }
     if(name==='manage'){await manage(d.kind);return;}
     if(name==='manage-refs'){s.modal.refId=d.id;s.modal.references=(await papi(`/history/${s.modal.kind}/${d.id}`)).references;return;}
-    if(name==='manage-archive'){const k=s.modal.kind;await papi(`/history/${k}/${d.id}/${d.restore==='true'?'restore':'archive'}`,'POST',{});await catalog();await manage(k==='execution_plan'?'plan':k);return;}
-    if(name==='manage-delete'){if(!confirm('永久删除此对象全部版本？有引用时会拒绝。'))return;const k=s.modal.kind;await papi(`/history/${k}/${d.id}`,'DELETE',{confirm_id:d.id});await catalog();await manage(k==='execution_plan'?'plan':k);return;}
-    if(name==='prev'||name==='next'){const dir=name==='next'?1:-1;if(d.type==='data'){s.offset+=dir*s.size;await loadRows();}if(d.type==='history'){s.historyOffset+=dir*20;await loadHistory();}if(d.type==='previewRows'){await loadPreviewSample(s.modal,s.modal.offset+dir*20);}if(d.type==='results'){const v=view();v.offset+=dir*v.size;await loadView(v.run.id,v);}return;}
+    if (name === 'manage-archive' || name === 'manage-delete') {
+      const k = s.modal.kind, kind = k === 'execution_plan' ? 'plan' : k;
+      const restore = d.restore === 'true';
+      if (!restore && s[kind]?.id === d.id && !allowDiscard(kind)) return;
+      if (name === 'manage-delete') {
+        if (!confirm('永久删除此对象全部版本？有引用时会拒绝。')) return;
+        await papi(`/history/${k}/${d.id}`, 'DELETE', {confirm_id:d.id});
+      } else {
+        await papi(`/history/${k}/${d.id}/${restore ? 'restore' : 'archive'}`, 'POST', {});
+      }
+      if (!restore) forgetSelection(kind, d.id);
+      await catalog();
+      schedulePlan();
+      await manage(kind);
+      return;
+    }
+    if (name === 'prev' || name === 'next') {
+      const dir = name === 'next' ? 1 : -1;
+      if (d.type === 'data') await loadRows(s.offset + dir * s.size);
+      if (d.type === 'history') await loadHistory(s.historyOffset + dir * 20);
+      if (d.type === 'previewRows') await loadPreviewSample(s.modal, s.modal.offset + dir * 20);
+      if (d.type === 'results') {
+        const v = view();
+        await loadView(v.run.id, v, {offset:v.offset + dir * v.size});
+      }
+      return;
+    }
     if(name==='model-new'){modelForm(null);s.profileName='新的模型配置';s.connection={api_url:'',api_key:'',model:'',max_tokens:4096,timeout:120,stream:false,enable_thinking:false,skip_special_tokens:false};return;}
     if(name==='model-copy'){s.profileId=null;s.profileName+=' 副本';s.connection.api_key='';return;}
     if(name==='model-save'){const v=await api('/llm/profiles'+(s.profileId?'/'+s.profileId:''),s.profileId?'PUT':'POST',{name:s.profileName,...s.connection,execution:s.execution});s.profileId=v.profile_id;await refreshModels();modelForm(s.llm.profiles.find(p=>p.id===s.profileId));s.notice='已保存模型配置「'+s.profileName+'」。';return;}
@@ -851,24 +1121,34 @@
       if (preview) preview.result = null;
       return;
     }
-    if(bind.startsWith('choose.')){if(!allowDiscard()||!value)return;const kind=bind.slice(7),v=await papi('/entities/'+value);if(kind==='dataset')await setDataset(v);if(kind==='standard')await setStandard(v);if(kind==='plan')await setPlan(v);return;}
-    if(bind.startsWith('version.')){if(!allowDiscard())return;const kind=bind.slice(8),v=await papi(`/entities/${s[kind].id}?version=${value}`);if(kind==='standard')await setStandard(v);else await setPlan(v);return;}
+    if(bind.startsWith('choose.')){const kind=bind.slice(7);if(!value||!allowDiscard(kind))return;const v=await papi('/entities/'+value);if(kind==='dataset')await setDataset(v);if(kind==='standard')await setStandard(v);if(kind==='plan')await setPlan(v);return;}
+    if(bind.startsWith('version.')){const kind=bind.slice(8);if(!allowDiscard(kind))return;const v=await papi(`/entities/${s[kind].id}?version=${value}`);if(kind==='standard')await setStandard(v);else await setPlan(v);return;}
     if(bind.startsWith('standard.')){s.standard[bind.slice(9)]=value;s.standardDirty=true;scheduleTemplate();return;}
     if(bind.startsWith('plan.')){s.plan[bind.slice(5)]=value;s.planDirty=true;schedulePlan();return;}
     if(bind.startsWith('refversion.')){const ref=s.plan.groups.flatMap(g=>g.standards).find(r=>r.standard_id===bind.slice(11));ref.version=Number(value);s.planDirty=true;schedulePlan();return;}
     if(bind.startsWith('move.')){if(value)moveRef(bind.slice(5),value);return;}
     if(bind.startsWith('merge.')){if(value){const g=s.plan.groups.find(g=>g.id===bind.slice(6));for(const ref of [...g.standards])moveRef(ref.standard_id,value);}return;}
-    if(bind.startsWith('result.')){const v=view();v[bind.slice(7)]=value;v.offset=0;await loadView(v.run.id,v);return;}
-    if(bind.startsWith('size.')){const t=bind.slice(5);if(t==='data'){s.size=Number(value);s.offset=0;await loadRows();}else{const v=view();v.size=Number(value);v.offset=0;await loadView(v.run.id,v);}return;}
-    if(bind.startsWith('exportField.')){const name=bind.slice(12),cols=s.exportFields||[...view().run.snapshot.dataset.original_columns];s.exportFields=cols.filter(v=>v!==name);if(value)s.exportFields.push(name);return;}
+    if(bind.startsWith('result.')){const v=view();await loadView(v.run.id,v,{[bind.slice(7)]:value,offset:0});return;}
+    if(bind.startsWith('size.')){const size=Number(value);if(bind==='size.data')await loadRows(0,size);else{const v=view();await loadView(v.run.id,v,{size,offset:0});}return;}
+    if (bind === 'includeRaw') { view().includeRaw = value; return; }
+    if (bind.startsWith('exportField.')) {
+      const v = view(), column = bind.slice(12), columns = v.run.snapshot.dataset.original_columns;
+      const selected = new Set(v.exportFields || columns);
+      if (value) selected.add(column);
+      else selected.delete(column);
+      v.exportFields = columns.filter(name => selected.has(name));
+      return;
+    }
     if(bind==='profile'){modelForm(s.llm.profiles.find(p=>p.id===value));return;}
     if(bind.startsWith('connection.')){s.connection[bind.slice(11)]=value;return;}
     if(bind.startsWith('execution.')){s.execution[bind.slice(10)]=Number(value);return;}
-    s[bind]=value;if(['historyStatus','historyDataset','historyArchived'].includes(bind)){s.historyOffset=0;await loadHistory();}
+    if (['historyStatus','historyDataset','historyArchived'].includes(bind)) await loadHistory(0,{[bind]:value});
+    else s[bind] = value;
   }
   root.addEventListener('click', event => {
     const page = event.target.closest('[data-page]');
     if (page) {
+      if (s.busy) return;
       s.page = Number(page.dataset.page);
       render();
       if (s.page === 5 && s.project) action(loadHistory);
@@ -876,6 +1156,11 @@
     }
     const button = event.target.closest('[data-action]');
     if (!button) return;
+    if (button.dataset.action === 'dismiss-error') {
+      s.error = '';
+      button.closest('.action-error').remove();
+      return;
+    }
     if (button.dataset.action === 'modal-close') { closeModal(); return; }
     if (button.dataset.action === 'data-cell') { if (!s.busy) openDataCell(button); return; }
     if (button.dataset.action === 'copy-data') { copyDataValue(); return; }
@@ -900,9 +1185,26 @@
     const status = kind && root.querySelector('.save-state');
     if (status) status.outerHTML = saveState(s[kind], true);
   });
-  root.addEventListener('change',e=>{const el=e.target;if(el.dataset.row){s.selected=s.selected.filter(v=>v!==el.dataset.row);if(el.checked)s.selected.push(el.dataset.row);render();return;}if(el.dataset.bind&&(el.tagName==='SELECT'||el.type==='checkbox'))action(()=>change(el.dataset.bind,el.type==='checkbox'?el.checked:el.value));});
+  root.addEventListener('change',e=>{const el=e.target;if(el.dataset.row){if(s.busy||!selectableRow(el.dataset.row))return;s.selected=s.selected.filter(v=>v!==el.dataset.row);if(el.checked)s.selected.push(el.dataset.row);render();return;}if(el.dataset.bind&&(el.tagName==='SELECT'||el.type==='checkbox'))action(()=>change(el.dataset.bind,el.type==='checkbox'?el.checked:el.value));});
   document.addEventListener('keydown',e=>{if(!s.modal)return;if(e.key==='Escape'){closeModal();return;}if(e.key==='Tab'){const nodes=[...root.querySelectorAll('[role=dialog] :is(button,input,select,textarea):not(:disabled),[role=dialog] summary')].filter(node=>node.getClientRects().length),first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}});
   window.addEventListener('beforeunload',e=>{if(dirty()){e.preventDefault();e.returnValue='';}});
-  setInterval(async()=>{if(polling||s.busy||!s.project)return;const v=view();if(!v||!active(v.run.status))return;polling=true;const epoch=s.epoch;try{await loadView(v.run.id,v);if(epoch===s.epoch){const target=s.modal?.type==='run'?root.querySelector('.workspace-dialog-body'):s.page===4?document.getElementById('active-results'):null;if(target){target.innerHTML=runView(v);scrollbars();}}}catch(e){if(!e.stale)s.error='读取进度失败：'+e.message;}finally{polling=false;}},1500);
-  (async()=>{render();const initialEpoch=s.epoch;try{await Promise.all([api('/projects').then(v=>{s.projects=v.projects;}),refreshModels()]);const last=localStorage.getItem('eval.v1_1.r4.project');if(initialEpoch===s.epoch&&!s.project&&s.projects.some(p=>p.id===last))await openProject(last);}catch(e){s.error=e.message;}render();})();
+  setInterval(async () => {
+    const result = visibleResult();
+    if (polling || s.busy || !result || result.tab === 'statistics' || !active(result.run.status)) return;
+    polling = true;
+    try {
+      await loadView(result.run.id, result);
+      if (!s.busy && visibleResult() === result && result.tab !== 'statistics') render();
+    } catch (error) {
+      if (!error.stale && !s.busy && visibleResult() === result) {
+        s.error = '读取进度失败：' + error.message;
+        render();
+      }
+    } finally { polling = false; }
+  }, 1500);
+  action(async () => {
+    await Promise.all([loadProjects(), refreshModels()]);
+    const last = localStorage.getItem('eval.v1_1.r4.project');
+    if (s.projects.some(project => project.id === last)) await openProject(last);
+  });
 })();
